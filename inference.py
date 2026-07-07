@@ -1,29 +1,27 @@
-import torch
+import json
 import os
 import sys
 import time
-import json
+
 import numpy as np
+import torch
 from tqdm import tqdm
-import time
-import json
 
 from onescience.datapipes.climate import ERA5Datapipe
 from onescience.models.pangu import Pangu
 from onescience.utils.YParams import YParams
 
+
 POSITION_BIAS_NAME = "earth_position_bias_table"
 
 
 def get_stats(data_dir, channels):
-    """从 metadata.json 读取变量列表，提取归一化参数"""
     with open(os.path.join(data_dir, "metadata.json"), "r") as f:
         metadata = json.load(f)
     all_variables = metadata["variables"]
-
     channel_indices = [all_variables.index(v) for v in channels]
     stats_dir = os.path.join(data_dir, "stats")
-    mu = np.load(os.path.join(stats_dir, "global_means.npy"))   # [1, C, 1, 1]
+    mu = np.load(os.path.join(stats_dir, "global_means.npy"))
     std = np.load(os.path.join(stats_dir, "global_stds.npy"))
     return mu[:, channel_indices, :, :], std[:, channel_indices, :, :]
 
@@ -32,11 +30,6 @@ def find_checkpoint(checkpoint_dir):
     candidates = [
         os.environ.get("LIGHT_CKPT"),
         os.path.join(checkpoint_dir, "model_light_int8_bf16_mlpint8.pth"),
-        os.path.join(checkpoint_dir, "model_light_int8_bf16.pth"),
-        os.path.join(checkpoint_dir, "model_light_int8.pth"),
-        os.path.join(checkpoint_dir, "model_infer_int8_bias_bf16.pth"),
-        os.path.join(checkpoint_dir, "model_bak_light.pth"),
-        os.path.join(checkpoint_dir, "model_bak.pth"),
     ]
     for path in candidates:
         if path and os.path.exists(path):
@@ -136,17 +129,14 @@ if __name__ == "__main__":
     current_path = os.getcwd()
     sys.path.append(current_path)
 
-    ## Model config init
     config_file_path = os.path.join(current_path, "conf/config.yaml")
     cfg = YParams(config_file_path, "model")
-    ## DataLoader init
     cfg_data = YParams(config_file_path, "datapipe")
 
     device = torch.device("cuda:0")
     infer_dtype = torch.bfloat16
 
     means, stds = get_stats(cfg_data.dataset.data_dir, cfg_data.dataset.channels)
-
     datapipe = ERA5Datapipe(params=cfg_data, distributed=False)
     test_dataloader = datapipe.test_dataloader()
 
@@ -194,30 +184,34 @@ if __name__ == "__main__":
             filename = data[4][-1][0]
             if first:
                 first = False
-                print(f"  invar  shape: {list(invar.shape)}   ← [batch, channels, H, W]")
-                print(f"  outvar shape: {list(outvar.shape)}  ← [batch, channels, H, W]")
+                print(f"  invar  shape: {list(invar.shape)} -> [batch, channels, H, W]")
+                print(f"  outvar shape: {list(outvar.shape)} -> [batch, channels, H, W]")
                 print(f"  the first filename: {filename}")
 
             invar_surface = invar[:, :4, :, :].to(device=device, dtype=infer_dtype)
             invar_upper_air = invar[:, 4:, :, :].to(device=device, dtype=infer_dtype)
             invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
-            
-            #----------------------AI4S(时间度量不可更改)---------------------------
-            start_time = time.perf_counter()      # AI4S(时间度量，位置不可更改)
-            ort_out = ort_session.run(None, ort_input)
-            torch.cuda.synchronize()              # AI4S(时间度量，位置不可更改，新增)
-            end_time = time.perf_counter()        # AI4S(时间度量，位置不可更改)
-            time_list.append(end_time-start_time) # AI4S(时间度量，位置不可更改)
-            #---------------------------------------------------------------------
+
+            #----------------------AI4S(time measurement, do not move)---------------------------
+            start_time = time.perf_counter()
+            out_surface, out_upper_air = model(invar)
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            time_list.append(end_time - start_time)
+            #------------------------------------------------------------------------------------
 
             out_upper_air = out_upper_air.reshape(invar_upper_air.shape)
-            pred_var = torch.concat([out_surface, out_upper_air], dim=1).float().cpu().numpy()
+            out_surface_cpu = out_surface.cpu().float()
+            out_upper_air_cpu = out_upper_air.cpu().float()
+
+            del out_surface, out_upper_air, invar, invar_surface, invar_upper_air
+            torch.cuda.empty_cache()
+
+            pred_var = torch.concat([out_surface_cpu, out_upper_air_cpu], dim=1).numpy()
             pred_var = pred_var * stds + means
             np.save(f"result/output/{filename}.npy", pred_var)
 
+            del out_surface_cpu, out_upper_air_cpu, pred_var
 
-        #----------------------AI4S(时间度量不可更改)---------------------------
-        # 保存到 time_list.json 文件
         with open("result/time_record.json", "w", encoding="utf-8") as f:
             json.dump(time_list, f, ensure_ascii=False, indent=4)
-        #---------------------------------------------------------------------
