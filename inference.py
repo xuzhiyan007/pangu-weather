@@ -1,15 +1,18 @@
 import torch
 import os
 import sys
-import glob
+import time
+import json
 import numpy as np
-import h5py
 from tqdm import tqdm
 import time
 import json
+
+from onescience.datapipes.climate import ERA5Datapipe
 from onescience.models.pangu import Pangu
 from onescience.utils.YParams import YParams
-from onescience.datapipes.climate import ERA5Datapipe
+
+POSITION_BIAS_NAME = "earth_position_bias_table"
 
 
 def get_stats(data_dir, channels):
@@ -22,9 +25,111 @@ def get_stats(data_dir, channels):
     stats_dir = os.path.join(data_dir, "stats")
     mu = np.load(os.path.join(stats_dir, "global_means.npy"))   # [1, C, 1, 1]
     std = np.load(os.path.join(stats_dir, "global_stds.npy"))
-    means = mu[:, channel_indices, :, :]
-    stds = std[:, channel_indices, :, :]
-    return means, stds
+    return mu[:, channel_indices, :, :], std[:, channel_indices, :, :]
+
+
+def find_checkpoint(checkpoint_dir):
+    candidates = [
+        os.environ.get("LIGHT_CKPT"),
+        os.path.join(checkpoint_dir, "model_light_int8_bf16_mlpint8.pth"),
+        os.path.join(checkpoint_dir, "model_light_int8_bf16.pth"),
+        os.path.join(checkpoint_dir, "model_light_int8.pth"),
+        os.path.join(checkpoint_dir, "model_infer_int8_bias_bf16.pth"),
+        os.path.join(checkpoint_dir, "model_bak_light.pth"),
+        os.path.join(checkpoint_dir, "model_bak.pth"),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"No checkpoint found in {checkpoint_dir}")
+
+
+def dequantize_tensor(q, scale, zero_point=None, dtype=torch.bfloat16):
+    x = q.float()
+    if zero_point is not None:
+        x = x - zero_point.float()
+    if torch.is_tensor(scale) and scale.ndim == 1 and q.ndim >= 2 and scale.numel() == q.shape[0]:
+        scale = scale.float().view([q.shape[0]] + [1] * (q.ndim - 1))
+    else:
+        scale = scale.float()
+    x = x * scale
+    return x.to(dtype)
+
+
+def restore_fuser_aliases(state_dict):
+    additions = {}
+    for key, value in list(state_dict.items()):
+        if POSITION_BIAS_NAME not in key:
+            continue
+        if ".fuser." in key:
+            pair_key = key.replace(".fuser.", ".Fuser.")
+        elif ".Fuser." in key:
+            pair_key = key.replace(".Fuser.", ".fuser.")
+        else:
+            continue
+        if pair_key not in state_dict:
+            additions[pair_key] = value.clone()
+    state_dict.update(additions)
+
+
+def restore_quantized_group(state_dict, ckpt, value_name, scale_name, zero_point_name, infer_dtype):
+    quantized = ckpt.get(value_name, {})
+    scales = ckpt.get(scale_name, {})
+    zero_points = ckpt.get(zero_point_name, {})
+    for key, q in quantized.items():
+        if key not in scales:
+            raise KeyError(f"Missing int8 scale for {key}")
+        state_dict[key] = dequantize_tensor(
+            q,
+            scales[key],
+            zero_points.get(key),
+            dtype=infer_dtype,
+        )
+
+
+def unpack_light_checkpoint(ckpt, infer_dtype=torch.bfloat16):
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    state_dict = dict(state_dict)
+
+    restore_quantized_group(
+        state_dict,
+        ckpt,
+        "position_bias_int8",
+        "position_bias_scale",
+        "position_bias_zero_point",
+        infer_dtype,
+    )
+    restore_quantized_group(
+        state_dict,
+        ckpt,
+        "mlp_weight_int8",
+        "mlp_weight_scale",
+        "mlp_weight_zero_point",
+        infer_dtype,
+    )
+
+    scale_suffixes = (".scale", "_scale")
+    flat_scales = {
+        key: value
+        for key, value in list(state_dict.items())
+        if POSITION_BIAS_NAME in key and key.endswith(scale_suffixes)
+    }
+    for scale_key, scale in flat_scales.items():
+        for suffix in scale_suffixes:
+            if scale_key.endswith(suffix):
+                bias_key = scale_key[: -len(suffix)]
+                break
+        q = state_dict.get(bias_key)
+        if q is not None and getattr(q, "dtype", None) == torch.int8:
+            state_dict[bias_key] = dequantize_tensor(q, scale, dtype=infer_dtype)
+        state_dict.pop(scale_key, None)
+
+    for key, value in list(state_dict.items()):
+        if getattr(value, "dtype", None) == torch.int8:
+            raise ValueError(f"{key} is int8 but no scale was found for dequantization")
+
+    restore_fuser_aliases(state_dict)
+    return state_dict
 
 
 if __name__ == "__main__":
@@ -37,6 +142,9 @@ if __name__ == "__main__":
     ## DataLoader init
     cfg_data = YParams(config_file_path, "datapipe")
 
+    device = torch.device("cuda:0")
+    infer_dtype = torch.bfloat16
+
     means, stds = get_stats(cfg_data.dataset.data_dir, cfg_data.dataset.channels)
 
     datapipe = ERA5Datapipe(params=cfg_data, distributed=False)
@@ -46,21 +154,36 @@ if __name__ == "__main__":
     soil_type = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "soil_type.npy")).astype(np.float32))
     topography = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "topography.npy")).astype(np.float32))
     topography = (topography - topography.mean()) / (topography.std(unbiased=False) + 1e-6)
-    surface_mask = torch.stack([land_mask, soil_type, topography], dim=0).to('cuda:0')
+    surface_mask = torch.stack([land_mask, soil_type, topography], dim=0).to(device=device, dtype=infer_dtype)
     surface_mask = surface_mask.unsqueeze(0).repeat(cfg_data.dataloader.batch_size, 1, 1, 1)
 
-    ckpt = torch.load(f"{cfg.checkpoint_dir}/model_bak.pth", map_location="cuda:0")
-    model = Pangu(img_size=cfg_data.dataset.img_size,
-                  patch_size=cfg.patch_size,
-                  embed_dim=cfg.embed_dim,
-                  num_heads=cfg.num_heads,
-                  window_size=cfg.window_size,
-                  ).to('cuda:0')
-    model.load_state_dict(ckpt["model_state_dict"])
+    ckpt_path = find_checkpoint(cfg.checkpoint_dir)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_state = unpack_light_checkpoint(ckpt, infer_dtype=infer_dtype)
 
+    model = Pangu(
+        img_size=cfg_data.dataset.img_size,
+        patch_size=cfg.patch_size,
+        embed_dim=cfg.embed_dim,
+        num_heads=cfg.num_heads,
+        window_size=cfg.window_size,
+    ).to(device=device, dtype=infer_dtype)
+    missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+    bad_missing = [key for key in missing_keys if "attn_mask" not in key]
+    if bad_missing or unexpected_keys:
+        raise RuntimeError(
+            "Checkpoint did not match model. "
+            f"bad_missing={bad_missing[:20]}, unexpected={unexpected_keys[:20]}"
+        )
+    if missing_keys:
+        print(f"recreated {len(missing_keys)} attn_mask buffers from model init")
     model.eval()
-    os.makedirs('result/output/', exist_ok=True)                          # AI4S, 输出路径不可更改
-    print(f"📂 samples will be generated to './result/output/'")
+
+    os.makedirs("result/output/", exist_ok=True)
+    print(f"checkpoint: {ckpt_path}")
+    print(f"infer dtype: {infer_dtype}")
+    print("extra int8 storage: earth_position_bias_table + MLP fc1/fc2 weight")
+    print("samples will be generated to './result/output/'")
 
     time_list = []
     first = True
@@ -75,19 +198,20 @@ if __name__ == "__main__":
                 print(f"  outvar shape: {list(outvar.shape)}  ← [batch, channels, H, W]")
                 print(f"  the first filename: {filename}")
 
-            invar_surface = invar[:, :4, :, :].to("cuda:0", dtype=torch.float32)
-            invar_upper_air = invar[:, 4:, :, :].to("cuda:0", dtype=torch.float32)
+            invar_surface = invar[:, :4, :, :].to(device=device, dtype=infer_dtype)
+            invar_upper_air = invar[:, 4:, :, :].to(device=device, dtype=infer_dtype)
             invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
             
             #----------------------AI4S(时间度量不可更改)---------------------------
             start_time = time.perf_counter()      # AI4S(时间度量，位置不可更改)
-            out_surface, out_upper_air = model(invar)
+            ort_out = ort_session.run(None, ort_input)
+            torch.cuda.synchronize()              # AI4S(时间度量，位置不可更改，新增)
             end_time = time.perf_counter()        # AI4S(时间度量，位置不可更改)
             time_list.append(end_time-start_time) # AI4S(时间度量，位置不可更改)
             #---------------------------------------------------------------------
 
             out_upper_air = out_upper_air.reshape(invar_upper_air.shape)
-            pred_var = torch.concat([out_surface, out_upper_air], dim=1).cpu().numpy()
+            pred_var = torch.concat([out_surface, out_upper_air], dim=1).float().cpu().numpy()
             pred_var = pred_var * stds + means
             np.save(f"result/output/{filename}.npy", pred_var)
 
