@@ -13,6 +13,7 @@ from onescience.datapipes.climate import ERA5Datapipe
 from onescience.utils.YParams import YParams
 from onescience.memory.checkpoint import replace_function
 from apex import optimizers
+from torch.utils.data import Subset
 
 
 def loss_func(x, y, weights, level_weight=1.0):
@@ -20,7 +21,14 @@ def loss_func(x, y, weights, level_weight=1.0):
 
 def main():
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler("training.log"),
+            logging.StreamHandler()
+        ]
+    )
     logger = logging.getLogger()
 
     ## Model config init
@@ -120,6 +128,23 @@ def main():
         if world_rank == 0:
             print(f"resume from epoch {start_epoch}, batch {start_batch}")
 
+    # 续训时重建 DataLoader 跳过已处理 batch，避免逐个加载数据
+    if start_batch > 0 and train_sampler is None:
+        dataset = train_dataloader.dataset
+        skip_samples = start_batch * cfg_data.dataloader.batch_size
+        subset = Subset(dataset, range(skip_samples, len(dataset)))
+        train_dataloader = torch.utils.data.DataLoader(
+            subset,
+            batch_size=cfg_data.dataloader.batch_size,
+            num_workers=train_dataloader.num_workers,
+            pin_memory=train_dataloader.pin_memory,
+            drop_last=train_dataloader.drop_last,
+            shuffle=False,
+        )
+        if world_rank == 0:
+            print(f"DataLoader rebuilt: {start_batch} batches skipped, {len(subset)} samples remain")
+        start_batch = 0
+
     ## Distributed model
     if cfg.world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
@@ -143,8 +168,11 @@ def main():
             train_max_batches = train_total
         start_time = time.time()
         last_interval_save = time.time()
+        if epoch == start_epoch and start_batch > 0:
+            logger.info(f"skipping first {start_batch} batches to resume...")
         for j, data in enumerate(train_dataloader):
             if epoch == start_epoch and j < start_batch:
+                logger.info(f"  skip progress: {j}/{start_batch} batches")
                 continue
             if train_skip_stride > 0 and j % train_skip_stride == (epoch % train_skip_stride):
                 continue
