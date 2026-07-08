@@ -141,12 +141,27 @@ def main():
             print("-" * 50 + "\n")
         ckpt = torch.load(warm_start_path, map_location=f'cuda:{local_rank}', weights_only=False)
         src_state = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-        missing_keys, unexpected_keys = model.load_state_dict(src_state, strict=False)
+
+        # 按形状过滤：patch_size 变更导致部分参数形状不匹配，strict=False 无法跳过
+        model_state = model.state_dict()
+        filtered_state = {}
+        shape_mismatch_keys = []
+        for k, v in src_state.items():
+            if k in model_state:
+                if model_state[k].shape == v.shape:
+                    filtered_state[k] = v
+                else:
+                    shape_mismatch_keys.append(k)
+
+        missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
         real_missing = [k for k in missing_keys if "attn_mask" not in k]
         attn_mask_missing = [k for k in missing_keys if "attn_mask" in k]
         if world_rank == 0:
-            print(f"✅ Transformer 主干权重已迁移（QKV/MLP/LayerNorm/position_bias）")
-            print(f"⚠️  {len(real_missing)} 个参数随机初始化（patch_embed/recovery/downsample/upsample）")
+            print(f"✅ 已迁移 {len(filtered_state)} 个参数（QKV/MLP/LayerNorm）")
+            if shape_mismatch_keys:
+                print(f"⚠️  {len(shape_mismatch_keys)} 个参数因 patch_size 变更跳过（形状不匹配）:")
+                print(f"   {shape_mismatch_keys[:10]}")
+            print(f"   {len(real_missing)} 个参数随机初始化（patch_embed/recovery/downsample/upsample）")
             print(f"   attn_mask buffer {len(attn_mask_missing)} 个将自动重建")
             if real_missing:
                 print(f"   missing keys (前20): {real_missing[:20]}")
@@ -161,18 +176,33 @@ def main():
     for name, param in model.named_parameters():
         if any(layer in name for layer in ["layer1", "layer2", "layer3", "layer4"]):
             param.requires_grad = False
+
+    # 解冻 earth_position_bias_table（形状因 patch_size 变更，需要从头学习）
+    for name, param in model.named_parameters():
+        if "earth_position_bias_table" in name:
+            param.requires_grad = True
+
     if world_rank == 0:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
-        print(f"🧊 Transformer 已冻结，仅训练 {trainable}/{total} 参数 ({trainable/total*100:.1f}%)")
+        print(f"🧊 Transformer 已冻结（QKV/MLP/LayerNorm），仅训练 {trainable}/{total} 参数 ({trainable/total*100:.1f}%)")
+        print(f"   earth_position_bias_table 已单独解冻，将从 trunc_normal 初始化开始学习")
         if unfreeze_epoch < 999:
             print(f"   将在 epoch {unfreeze_epoch} 解冻全部参数")
 
     ## torch.compile (PyTorch 2.0+): 算子融合 + 内核优化
     raw_model = model  # 保留原始模型引用，用于 replace_function
-    model = torch.compile(model)
-    if world_rank == 0:
-        print("⚡ torch.compile 已启用")
+    use_compile = os.environ.get("DISABLE_COMPILE", "0") != "1"
+    if use_compile:
+        import importlib
+        _dynamo = importlib.import_module("torch._dynamo")
+        _dynamo.config.suppress_errors = True  # 编译失败时自动回退 eager 模式
+        model = torch.compile(model)
+        if world_rank == 0:
+            print("⚡ torch.compile 已启用（编译失败时自动回退 eager）")
+    else:
+        if world_rank == 0:
+            print("⚠️ torch.compile 已禁用（DISABLE_COMPILE=1）")
 
     ## Optimizer init（仅优化可训练参数，冻结的参数不进入 optimizer）
     trainable_params = [p for p in model.parameters() if p.requires_grad]
