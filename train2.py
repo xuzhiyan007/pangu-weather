@@ -1,0 +1,295 @@
+import torch
+import os
+import sys
+import numpy as np
+import torch.distributed as dist
+import logging
+import time
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
+# from onescience.models.pangu import Pangu
+from pangu_patchsize import PanguPatchSize as Pangu
+from onescience.datapipes.climate import ERA5Datapipe
+from onescience.utils.YParams import YParams
+from onescience.memory.checkpoint import replace_function
+from apex import optimizers
+
+
+def loss_func(x, y, weights, level_weight=1.0):
+    return level_weight * (F.l1_loss(x, y, reduction='none') * weights).mean()
+
+def main():
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger()
+
+    ## Model config init
+    config_file_path = os.path.join(current_path, "conf/config2.yaml")
+    cfg = YParams(config_file_path, "model")
+
+    ## Distributed config init
+    cfg.world_size = 1
+    if "WORLD_SIZE" in os.environ:
+        cfg.world_size = int(os.environ["WORLD_SIZE"])
+    world_rank = 0
+    local_rank = 0
+    if cfg.world_size > 1:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_rank = dist.get_rank()
+
+    cfg_data = YParams(config_file_path, "datapipe")
+    datapipe = ERA5Datapipe(params=cfg_data, distributed=dist.is_initialized())
+    train_dataloader, train_sampler = datapipe.train_dataloader()
+    val_dataloader, val_sampler = datapipe.val_dataloader()
+
+    surface_weights = torch.as_tensor(cfg_data.dataset.weights[:4], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
+    pressure_weights = torch.as_tensor(cfg_data.dataset.weights[4:], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
+
+    land_mask = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "land_mask.npy")).astype(np.float32))
+    soil_type = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "soil_type.npy")).astype(np.float32))
+    topography = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "topography.npy")).astype(np.float32))
+    topography = (topography - topography.mean()) / (topography.std(unbiased=False) + 1e-6)
+    surface_mask = torch.stack([land_mask, soil_type, topography], dim=0).to(local_rank)
+    surface_mask = surface_mask.unsqueeze(0).repeat(cfg_data.dataloader.batch_size, 1, 1, 1)
+
+    ## Model init
+    model = Pangu(img_size=cfg_data.dataset.img_size,
+                  patch_size=cfg.patch_size,
+                  embed_dim=cfg.embed_dim,
+                  num_heads=cfg.num_heads,
+                  window_size=cfg.window_size,
+                  ).to(local_rank)
+    optimizer = optimizers.FusedAdam(model.parameters(), betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+    
+    ## Train process init
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    train_loss_file = f"{cfg.checkpoint_dir}/trloss_266.npy"
+    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_266.npy"
+    best_valid_loss = 1.0e6
+    best_loss_epoch = 0
+    train_losses = np.empty((0,), dtype=np.float32)
+    valid_losses = np.empty((0,), dtype=np.float32)
+
+    ## Get model params count
+    if cfg.world_size == 1:
+        total_params = sum(p.numel() for p in model.parameters())
+        print("\n\n")
+        print("-" * 50)
+        print(f"📂 now params is {total_params}, {total_params / 1e6:.2f}M, {total_params / 1e9:.2f}B")
+        print("-" * 50, "\n")
+
+    ## Checkpoint file names
+    best_ckpt_name = "model_266_bak.pth"
+    latest_ckpt_name = "model_266_latest.pth"
+    best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
+    latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
+    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "600"))
+
+    ## Load model weight if there exist well-trained model
+    start_epoch = 0
+    start_batch = 0
+    loaded_resume = False
+    resume_ckpt = latest_ckpt_path if os.path.exists(latest_ckpt_path) else best_ckpt_path
+    if os.path.exists(resume_ckpt):
+        if world_rank == 0:
+            print("\n")
+            print("-" * 50)
+            print(f"loading resume checkpoint: {resume_ckpt}")
+            print(f'If you want to train a new model, ensure there is no *.pth file in {cfg.checkpoint_dir}')
+            print("-" * 50 + "\n")
+        ckpt = torch.load(resume_ckpt, map_location=f'cuda:{local_rank}', weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        best_valid_loss = ckpt.get("best_valid_loss", best_valid_loss)
+        best_loss_epoch = ckpt.get("best_loss_epoch", best_loss_epoch)
+        saved_epoch = int(ckpt.get("epoch", -1))
+        if ckpt.get("epoch_complete", True):
+            start_epoch = saved_epoch + 1
+            start_batch = 0
+        else:
+            start_epoch = saved_epoch
+            start_batch = int(ckpt.get("next_batch_idx", 0))
+        if os.path.exists(train_loss_file):
+            train_losses = np.load(train_loss_file)
+        if os.path.exists(valid_loss_file):
+            valid_losses = np.load(valid_loss_file)
+        loaded_resume = True
+        if world_rank == 0:
+            print(f"resume from epoch {start_epoch}, batch {start_batch}")
+
+    ## Distributed model
+    if cfg.world_size > 1:
+        model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+
+    world_rank == 0 and logger.info(f"start training from epoch {start_epoch} ...")
+
+    for epoch in range(start_epoch, cfg.max_epoch):
+        if dist.is_initialized():
+            train_sampler.set_epoch(epoch)
+            val_sampler.set_epoch(epoch)
+
+        model.train()
+        train_loss = 0
+        processed_batches = 0
+        train_max_batches = int(os.environ.get("TRAIN_MAX_BATCHES", "2940"))
+        train_total = len(train_dataloader)
+        if train_max_batches > 0 and train_max_batches < train_total:
+            train_skip_stride = max(2, round(train_total / (train_total - train_max_batches)))
+        else:
+            train_skip_stride = 0
+            train_max_batches = train_total
+        start_time = time.time()
+        last_interval_save = time.time()
+        for j, data in enumerate(train_dataloader):
+            if epoch == start_epoch and j < start_batch:
+                continue
+            if train_skip_stride > 0 and j % train_skip_stride == (epoch % train_skip_stride):
+                continue
+            invar = data[0]
+            outvar = data[1]
+            invar_surface = invar[:, :4, :, :].to(local_rank, dtype=torch.float32)
+            invar_upper_air = invar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
+            invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
+            tar_surface = outvar[:, :4, :, :].to(local_rank, dtype=torch.float32)
+            tar_upper_air = outvar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
+
+            with replace_function(model,["layer2", "layer3"],cfg.world_size > 1):
+                out_surface, out_upper_air = model(invar)
+
+            out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
+            loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25)
+            loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0)
+            # 总 loss
+            loss = loss1 + loss2
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            processed_batches += 1
+            if world_rank == 0:
+                logger.info(f'Train: Epoch {epoch}-{processed_batches}/{train_max_batches} '
+                            f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
+                            f'[{(time.time()-start_time)/processed_batches: .02f}s/{cfg_data.dataloader.batch_size}batch] '
+                            f'loss:{train_loss / processed_batches: .04f}')
+                if save_interval_sec > 0 and time.time() - last_interval_save >= save_interval_sec:
+                    save_checkpoint(
+                        model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
+                        cfg.checkpoint_dir, latest_ckpt_name,
+                        epoch=epoch, next_batch_idx=j + 1, epoch_complete=False,
+                    )
+                    logger.info(f"interval checkpoint saved at epoch={epoch}, next_batch={j + 1}")
+                    last_interval_save = time.time()
+            
+        train_loss = train_loss / max(1, processed_batches)
+
+        model.eval()
+        valid_loss = 0
+        val_max_batches = int(os.environ.get("VAL_MAX_BATCHES", "400"))
+        val_total = len(val_dataloader)
+        if val_max_batches > 0 and val_max_batches < val_total:
+            val_stride = max(1, val_total // val_max_batches)
+        else:
+            val_stride = 1
+            val_max_batches = val_total
+        val_processed = 0
+        with torch.no_grad():
+            start_time = time.time()
+            for j, data in enumerate(val_dataloader):
+                if val_stride > 1 and j % val_stride != 0:
+                    continue
+                invar = data[0]
+                outvar = data[1]
+                invar_surface = invar[:, :4, :, :].to(local_rank, dtype=torch.float32)
+                invar_upper_air = invar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
+                invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
+                tar_surface = outvar[:, :4, :, :].to(local_rank, dtype=torch.float32)
+                tar_upper_air = outvar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
+
+                with replace_function(model,["layer2", "layer3"],cfg.world_size > 1):
+                    out_surface, out_upper_air = model(invar)
+
+                out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
+                loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25).item()
+                loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0).item()
+                # 总 loss
+                loss = loss1 + loss2
+
+                if cfg.world_size > 1:
+                    loss_tensor = torch.tensor(loss, device=local_rank)
+                    dist.all_reduce(loss_tensor)
+                    loss = loss_tensor.item() / cfg.world_size
+                valid_loss += loss
+                val_processed += 1
+                if world_rank == 0:
+                    logger.info(f'Valid: Epoch {epoch}-{val_processed}/{val_max_batches} '
+                            f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
+                            f'[{(time.time()-start_time)/val_processed: .02f}s/{cfg_data.dataloader.batch_size}batch] '
+                            f'loss:{valid_loss / val_processed: .04f}')
+                
+        valid_loss /= max(1, val_processed)
+        is_save_ckp = False
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            best_loss_epoch = epoch
+            if world_rank == 0:
+                save_checkpoint(
+                    model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
+                    cfg.checkpoint_dir, best_ckpt_name,
+                    epoch=epoch, next_batch_idx=0, epoch_complete=True,
+                )
+            is_save_ckp = True
+
+        scheduler.step()
+
+        if world_rank == 0:
+            save_checkpoint(
+                model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
+                cfg.checkpoint_dir, latest_ckpt_name,
+                epoch=epoch, next_batch_idx=0, epoch_complete=True,
+            )
+
+        if world_rank == 0:
+            logger.info(f"Epoch [{epoch}/{cfg.max_epoch}], "
+                        f"Train Loss: {train_loss:.4f}, "
+                        f"Valid Loss: {valid_loss:.4f}, "
+                        f"Best loss at Epoch: {best_loss_epoch}"
+                        + (", saving checkpoint" if is_save_ckp else "")
+                        )
+            train_losses = np.append(train_losses, train_loss)
+            valid_losses = np.append(valid_losses, valid_loss)
+
+            np.save(train_loss_file, train_losses)
+            np.save(valid_loss_file, valid_losses)
+
+        if epoch - best_loss_epoch > cfg.patience:
+            print(f"Loss has not decrease in {cfg.patience} epochs, stopping training...")
+            exit()
+
+
+def save_checkpoint(model, optimizer, scheduler, best_valid_loss, best_loss_epoch, model_path, filename, epoch=None, next_batch_idx=0, epoch_complete=True):
+    model_to_save = model.module if hasattr(model, "module") else model
+    state = {
+        "model_state_dict": model_to_save.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "best_valid_loss": best_valid_loss,
+        "best_loss_epoch": best_loss_epoch,
+        "epoch": epoch,
+        "next_batch_idx": next_batch_idx,
+        "epoch_complete": epoch_complete,
+    }
+    os.makedirs(model_path, exist_ok=True)
+    tmp_path = os.path.join(model_path, filename + ".tmp")
+    dst_path = os.path.join(model_path, filename)
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, dst_path)
+    print(f"saved checkpoint: {dst_path}")
+
+
+if __name__ == "__main__":
+    current_path = os.getcwd()
+    sys.path.append(current_path)
+    main()
