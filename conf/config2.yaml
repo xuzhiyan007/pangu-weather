@@ -116,9 +116,9 @@ datapipe:
   # DataLoader配置
   dataloader:
     mask_dtype: "float32"
-    batch_size: 1                     # AI4S，批处理大小推理阶段不可更改
-    num_workers: 0 
-    pin_memory: false 
+    batch_size: 4                     # AI4S，批处理大小推理阶段不可更改
+    num_workers: 4 
+    pin_memory: true 
     drop_last: true
     shuffle: false  # 使用sampler时设为false
     persistent_workers: false

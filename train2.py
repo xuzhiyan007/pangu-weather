@@ -14,6 +14,7 @@ from onescience.utils.YParams import YParams
 from onescience.memory.checkpoint import replace_function
 from apex import optimizers
 from torch.utils.data import Subset
+from torch.cuda.amp import autocast
 
 
 def loss_func(x, y, weights, level_weight=1.0):
@@ -68,8 +69,6 @@ def main():
                   num_heads=cfg.num_heads,
                   window_size=cfg.window_size,
                   ).to(local_rank)
-    optimizer = optimizers.FusedAdam(model.parameters(), betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     
     ## Train process init
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -99,18 +98,22 @@ def main():
     start_epoch = 0
     start_batch = 0
     loaded_resume = False
-    resume_ckpt = latest_ckpt_path if os.path.exists(latest_ckpt_path) else best_ckpt_path
-    if os.path.exists(resume_ckpt):
+    resume_ckpt_data = None
+    freeze_transformer = False
+    unfreeze_epoch = int(os.environ.get("UNFREEZE_EPOCH", "999"))
+
+    # ---- Step 1: 断点续训（优先）：266 checkpoint = 继承全量模型训练后的结果 ----
+    if os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path):
+        resume_ckpt = latest_ckpt_path if os.path.exists(latest_ckpt_path) else best_ckpt_path
         if world_rank == 0:
             print("\n")
             print("-" * 50)
             print(f"loading resume checkpoint: {resume_ckpt}")
-            print(f'If you want to train a new model, ensure there is no *.pth file in {cfg.checkpoint_dir}')
+            print(f'删除此文件可重新从全量模型 warm start')
             print("-" * 50 + "\n")
         ckpt = torch.load(resume_ckpt, map_location=f'cuda:{local_rank}', weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        resume_ckpt_data = ckpt
         best_valid_loss = ckpt.get("best_valid_loss", best_valid_loss)
         best_loss_epoch = ckpt.get("best_loss_epoch", best_loss_epoch)
         saved_epoch = int(ckpt.get("epoch", -1))
@@ -127,6 +130,61 @@ def main():
         loaded_resume = True
         if world_rank == 0:
             print(f"resume from epoch {start_epoch}, batch {start_batch}")
+
+    # ---- Step 1 (备): warm start：无 266 checkpoint 时，从 244 全量权重部分迁移 ----
+    elif os.path.exists(os.path.join(cfg.checkpoint_dir, "model_bak.pth")):
+        warm_start_path = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
+        if world_rank == 0:
+            print("\n")
+            print("-" * 50)
+            print(f"🔥 warm start from 244 checkpoint: {warm_start_path}")
+            print("-" * 50 + "\n")
+        ckpt = torch.load(warm_start_path, map_location=f'cuda:{local_rank}', weights_only=False)
+        src_state = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+        missing_keys, unexpected_keys = model.load_state_dict(src_state, strict=False)
+        real_missing = [k for k in missing_keys if "attn_mask" not in k]
+        attn_mask_missing = [k for k in missing_keys if "attn_mask" in k]
+        if world_rank == 0:
+            print(f"✅ Transformer 主干权重已迁移（QKV/MLP/LayerNorm/position_bias）")
+            print(f"⚠️  {len(real_missing)} 个参数随机初始化（patch_embed/recovery/downsample/upsample）")
+            print(f"   attn_mask buffer {len(attn_mask_missing)} 个将自动重建")
+            if real_missing:
+                print(f"   missing keys (前20): {real_missing[:20]}")
+            if unexpected_keys:
+                print(f"   unexpected keys (前20): {list(unexpected_keys)[:20]}")
+            print("   optimizer/scheduler 从头初始化，从 epoch 0 开始训练")
+        start_epoch = 0
+        start_batch = 0
+
+    # ---- Step 2: 无论哪种加载方式，都冻结 Transformer 层 ----
+    freeze_transformer = True
+    for name, param in model.named_parameters():
+        if any(layer in name for layer in ["layer1", "layer2", "layer3", "layer4"]):
+            param.requires_grad = False
+    if world_rank == 0:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"🧊 Transformer 已冻结，仅训练 {trainable}/{total} 参数 ({trainable/total*100:.1f}%)")
+        if unfreeze_epoch < 999:
+            print(f"   将在 epoch {unfreeze_epoch} 解冻全部参数")
+
+    ## torch.compile (PyTorch 2.0+): 算子融合 + 内核优化
+    raw_model = model  # 保留原始模型引用，用于 replace_function
+    model = torch.compile(model)
+    if world_rank == 0:
+        print("⚡ torch.compile 已启用")
+
+    ## Optimizer init（仅优化可训练参数，冻结的参数不进入 optimizer）
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optimizers.FusedAdam(trainable_params, betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+
+    ## 断点续训时恢复 optimizer/scheduler 状态
+    if resume_ckpt_data is not None:
+        optimizer.load_state_dict(resume_ckpt_data["optimizer_state_dict"])
+        scheduler.load_state_dict(resume_ckpt_data["scheduler_state_dict"])
+        if world_rank == 0:
+            print("✅ optimizer/scheduler 状态已恢复")
 
     # 续训时重建 DataLoader 跳过已处理 batch，避免逐个加载数据
     if start_batch > 0 and train_sampler is None:
@@ -156,6 +214,18 @@ def main():
             train_sampler.set_epoch(epoch)
             val_sampler.set_epoch(epoch)
 
+        # 解冻逻辑：到达指定 epoch 时解除 Transformer 冻结，全量微调
+        if freeze_transformer and epoch == unfreeze_epoch:
+            for param in raw_model.parameters():
+                param.requires_grad = True
+            optimizer = optimizers.FusedAdam(
+                [p for p in model.parameters() if p.requires_grad],
+                betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6
+            )
+            freeze_transformer = False
+            if world_rank == 0:
+                logger.info(f"🔓 epoch {epoch}: Transformer 已解冻，全量参数训练")
+
         model.train()
         train_loss = 0
         processed_batches = 0
@@ -184,12 +254,12 @@ def main():
             tar_surface = outvar[:, :4, :, :].to(local_rank, dtype=torch.float32)
             tar_upper_air = outvar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
 
-            with replace_function(model,["layer2", "layer3"],cfg.world_size > 1):
-                out_surface, out_upper_air = model(invar)
-
-            out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
-            loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25)
-            loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0)
+            with replace_function(raw_model,["layer2", "layer3"],cfg.world_size > 1):
+                with autocast(dtype=torch.bfloat16):
+                    out_surface, out_upper_air = model(invar)
+                    out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
+                    loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25)
+                    loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0)
             # 总 loss
             loss = loss1 + loss2
             optimizer.zero_grad()
@@ -236,12 +306,12 @@ def main():
                 tar_surface = outvar[:, :4, :, :].to(local_rank, dtype=torch.float32)
                 tar_upper_air = outvar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
 
-                with replace_function(model,["layer2", "layer3"],cfg.world_size > 1):
-                    out_surface, out_upper_air = model(invar)
-
-                out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
-                loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25).item()
-                loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0).item()
+                with replace_function(raw_model,["layer2", "layer3"],cfg.world_size > 1):
+                    with autocast(dtype=torch.bfloat16):
+                        out_surface, out_upper_air = model(invar)
+                        out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
+                        loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25).item()
+                        loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0).item()
                 # 总 loss
                 loss = loss1 + loss2
 
