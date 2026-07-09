@@ -92,7 +92,7 @@ def main():
     latest_ckpt_name = "model_288_latest.pth"
     best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
-    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "60"))
+    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "600"))
 
     ## Load model weight if there exist well-trained model
     start_epoch = 0
