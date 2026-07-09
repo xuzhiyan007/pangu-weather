@@ -60,7 +60,7 @@ def main():
     topography = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "topography.npy")).astype(np.float32))
     topography = (topography - topography.mean()) / (topography.std(unbiased=False) + 1e-6)
     surface_mask = torch.stack([land_mask, soil_type, topography], dim=0).to(local_rank)
-    surface_mask = surface_mask.unsqueeze(0).repeat(cfg_data.dataloader.batch_size, 1, 1, 1)
+    surface_mask = surface_mask.unsqueeze(0)  # [1, 3, H, W], 循环中用 expand 动态匹配 batch_size
 
     ## Model init
     model = Pangu(img_size=cfg_data.dataset.img_size,
@@ -217,11 +217,16 @@ def main():
             print("✅ optimizer/scheduler 状态已恢复")
 
     # 续训时重建 DataLoader 跳过已处理 batch，避免逐个加载数据
+    # 注意：仅用于续训 epoch，后续 epoch 必须恢复全量 DataLoader
+    resume_batch_offset = start_batch
+    original_train_dataloader = train_dataloader
+    resume_dataloader = None
+
     if start_batch > 0 and train_sampler is None:
         dataset = train_dataloader.dataset
         skip_samples = start_batch * cfg_data.dataloader.batch_size
         subset = Subset(dataset, range(skip_samples, len(dataset)))
-        train_dataloader = torch.utils.data.DataLoader(
+        resume_dataloader = torch.utils.data.DataLoader(
             subset,
             batch_size=cfg_data.dataloader.batch_size,
             num_workers=train_dataloader.num_workers,
@@ -259,18 +264,37 @@ def main():
         model.train()
         train_loss = 0
         processed_batches = 0
+
+        # 续训 epoch 用截断 DataLoader，后续 epoch 恢复全量 DataLoader
+        if epoch == start_epoch and resume_dataloader is not None:
+            current_dataloader = resume_dataloader
+            current_offset = resume_batch_offset
+        else:
+            current_dataloader = original_train_dataloader
+            current_offset = 0
+
+        # train_max_batches / train_skip_stride 始终基于全量 DataLoader 计算
         train_max_batches = int(os.environ.get("TRAIN_MAX_BATCHES", "2940"))
-        train_total = len(train_dataloader)
-        if train_max_batches > 0 and train_max_batches < train_total:
-            train_skip_stride = max(2, round(train_total / (train_total - train_max_batches)))
+        full_train_total = len(original_train_dataloader)
+        if train_max_batches > 0 and train_max_batches < full_train_total:
+            train_skip_stride = max(2, round(full_train_total / (full_train_total - train_max_batches)))
         else:
             train_skip_stride = 0
-            train_max_batches = train_total
+            train_max_batches = full_train_total
+
+        # 续训 epoch 处理剩余 batch，不做 stride 跳过
+        if epoch == start_epoch and resume_dataloader is not None:
+            train_skip_stride = 0
+        accumulation_steps = int(os.environ.get("ACCUMULATION_STEPS", "2"))
+        effective_batch_size = cfg_data.dataloader.batch_size * accumulation_steps
+        if world_rank == 0:
+            logger.info(f"gradient accumulation: {accumulation_steps} steps, effective batch_size={effective_batch_size}")
         start_time = time.time()
         last_interval_save = time.time()
         if epoch == start_epoch and start_batch > 0:
             logger.info(f"skipping first {start_batch} batches to resume...")
-        for j, data in enumerate(train_dataloader):
+        optimizer.zero_grad()
+        for j, data in enumerate(current_dataloader):
             if epoch == start_epoch and j < start_batch:
                 logger.info(f"  skip progress: {j}/{start_batch} batches")
                 continue
@@ -280,7 +304,7 @@ def main():
             outvar = data[1]
             invar_surface = invar[:, :4, :, :].to(local_rank, dtype=torch.float32)
             invar_upper_air = invar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
-            invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
+            invar = torch.concat([invar_surface, surface_mask.expand(invar_surface.shape[0], -1, -1, -1), invar_upper_air], dim=1)
             tar_surface = outvar[:, :4, :, :].to(local_rank, dtype=torch.float32)
             tar_upper_air = outvar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
 
@@ -290,27 +314,32 @@ def main():
                     out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
                     loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25)
                     loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0)
-            # 总 loss
-            loss = loss1 + loss2
-            optimizer.zero_grad()
+            # 总 loss（按累积步数缩放，使梯度等价于大 batch）
+            loss = (loss1 + loss2) / accumulation_steps
             loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+            train_loss += (loss.item() * accumulation_steps)  # 记录原始 loss 用于日志
             processed_batches += 1
+            if processed_batches % accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
             if world_rank == 0:
-                logger.info(f'Train: Epoch {epoch}-{processed_batches}/{train_max_batches} '
+                logger.info(f'Train: Epoch {epoch}-{current_offset + processed_batches}/{train_max_batches} '
                             f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
-                            f'[{(time.time()-start_time)/processed_batches: .02f}s/{cfg_data.dataloader.batch_size}batch] '
+                            f'[{(time.time()-start_time)/processed_batches: .02f}s/{effective_batch_size}batch] '
                             f'loss:{train_loss / processed_batches: .04f}')
                 if save_interval_sec > 0 and time.time() - last_interval_save >= save_interval_sec:
                     save_checkpoint(
                         model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
                         cfg.checkpoint_dir, latest_ckpt_name,
-                        epoch=epoch, next_batch_idx=j + 1, epoch_complete=False,
+                        epoch=epoch, next_batch_idx=current_offset + j + 1, epoch_complete=False,
                     )
-                    logger.info(f"interval checkpoint saved at epoch={epoch}, next_batch={j + 1}")
+                    logger.info(f"interval checkpoint saved at epoch={epoch}, next_batch={current_offset + j + 1}")
                     last_interval_save = time.time()
             
+        # epoch 结束时处理残留的累积梯度
+        if processed_batches % accumulation_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad()
         train_loss = train_loss / max(1, processed_batches)
 
         model.eval()
@@ -332,7 +361,7 @@ def main():
                 outvar = data[1]
                 invar_surface = invar[:, :4, :, :].to(local_rank, dtype=torch.float32)
                 invar_upper_air = invar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
-                invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
+                invar = torch.concat([invar_surface, surface_mask.expand(invar_surface.shape[0], -1, -1, -1), invar_upper_air], dim=1)
                 tar_surface = outvar[:, :4, :, :].to(local_rank, dtype=torch.float32)
                 tar_upper_air = outvar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
 
