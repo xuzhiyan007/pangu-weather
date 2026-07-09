@@ -1,10 +1,15 @@
 model:
     start_epoch: 0
-    max_epoch: 2            
-    patch_size: [2, 4, 4]
+    max_epoch: 5            
+    patch_size: [2, 6, 6]
     embed_dim: 192
     num_heads: [6, 12, 12, 6]
     window_size: [2, 6, 12]
+    # ---- block 级剪枝配置 ----
+    # layer2_depth/layer3_depth 控制 Transformer block 数量（原版各 6）
+    # 方案A: layer3_depth=3（剪掉 block3/4/5，保留 block0/1/2）
+    layer2_depth: 6
+    layer3_depth: 3
     patience: 50
     checkpoint_dir: "./data/checkpoints"         # AI4S，路径不可更改
 
@@ -16,21 +21,21 @@ datapipe:
   dataset:
     type: "hdf5"
     
-    # stats_dir: "/work2/share/sugonhpcapp01/ERA5/old-data/stats"     # AI4S，拉取远程ERA5数据
-    # static_dir: "/work2/share/sugonhpcapp01/ERA5/old-data/static"   # AI4S，拉取远程ERA5数据
-    # data_dir: "/work2/share/sugonhpcapp01/ERA5/old-data"            # AI4S，拉取远程ERA5数据
+    stats_dir: "/public/SothisAI/sharingCenter/xiaodao2026/ERA5/old-data/stats"
+    static_dir: "/public/SothisAI/sharingCenter/xiaodao2026/ERA5/old-data/static"
+    data_dir: "/public/SothisAI/sharingCenter/xiaodao2026/ERA5/old-data"
 
     # train_ratio: [1980, 1981, 1982, 1983, 1984, 1985]
     # val_ratio: [1986] 
     # test_ratio: [2000]                                # AI4S，后台测试中，该年份只是标识，并非真实年份, 提交代码时需修改为[2050, 2052, 2054, 2056, 2058] ！！！！
 
-    stats_dir: "../onedatasets/ERA5_test/stats/"     # AI4S，路径不可更改, 拉取本地ERA5数据
-    static_dir: "../onedatasets/ERA5_test/static/"   # AI4S，路径不可更改, 拉取本地本地ERA5数据
-    data_dir: "../onedatasets/ERA5_test/"            # AI4S，路径不可更改 , 拉取本地本地ERA5数据
+      # stats_dir: "../onedatasets/ERA5_test/stats/"     # AI4S，路径不可更改, 拉取本地ERA5数据
+      # static_dir: "../onedatasets/ERA5_test/static/"   # AI4S，路径不可更改, 拉取本地本地ERA5数据
+      # data_dir: "../onedatasets/ERA5_test/"            # AI4S，路径不可更改 , 拉取本地本地ERA5数据
 
-    train_ratio: [1977]
-    val_ratio: [2005]
-    test_ratio: [2012] # [2050, 2052, 2054, 2056, 2058]       # AI4S，后台测试中，该年份只是标识，并非真实年份, 提交代码时需修改为[2050, 2052, 2054, 2056, 2058] ！！！！
+    train_ratio: [1983, 1985, 1987]
+    val_ratio: [1986]
+    test_ratio: [1999] # [2050, 2052, 2054, 2056, 2058]       # AI4S，后台测试中，该年份只是标识，并非真实年份, 提交代码时需修改为[2050, 2052, 2054, 2056, 2058] ！！！！
 
     img_size: [721, 1440]    # AI4S，测试集空间分辨率为该大小，更改报错
     verbose: true
@@ -116,9 +121,9 @@ datapipe:
   # DataLoader配置
   dataloader:
     mask_dtype: "float32"
-    batch_size: 1                     # AI4S，批处理大小推理阶段不可更改
-    num_workers: 0 
-    pin_memory: false 
+    batch_size: 4                     # AI4S，批处理大小推理阶段不可更改
+    num_workers: 4 
+    pin_memory: true 
     drop_last: true
     shuffle: false  # 使用sampler时设为false
     persistent_workers: false
@@ -132,6 +137,3 @@ datapipe:
     shuffle: true
     seed: 42
     drop_last: true
-      
-
-

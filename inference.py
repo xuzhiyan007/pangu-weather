@@ -8,7 +8,8 @@ import torch
 from tqdm import tqdm
 
 from onescience.datapipes.climate import ERA5Datapipe
-from onescience.models.pangu import Pangu
+# from onescience.models.pangu import Pangu
+from pangu_patchsize import PanguPatchSize as Pangu
 from onescience.utils.YParams import YParams
 
 
@@ -29,7 +30,7 @@ def get_stats(data_dir, channels):
 def find_checkpoint(checkpoint_dir):
     candidates = [
         os.environ.get("LIGHT_CKPT"),
-        os.path.join(checkpoint_dir, "model_light_int8_bf16_mlpint8.pth"),
+        os.path.join(checkpoint_dir, "model_266_pruned_light_int8_bf16_mlpint8.pth"),
     ]
     for path in candidates:
         if path and os.path.exists(path):
@@ -145,26 +146,36 @@ if __name__ == "__main__":
     topography = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "topography.npy")).astype(np.float32))
     topography = (topography - topography.mean()) / (topography.std(unbiased=False) + 1e-6)
     surface_mask = torch.stack([land_mask, soil_type, topography], dim=0).to(device=device, dtype=infer_dtype)
-    surface_mask = surface_mask.unsqueeze(0).repeat(cfg_data.dataloader.batch_size, 1, 1, 1)
+    surface_mask = surface_mask.unsqueeze(0)
 
     ckpt_path = find_checkpoint(cfg.checkpoint_dir)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model_state = unpack_light_checkpoint(ckpt, infer_dtype=infer_dtype)
 
+    layer2_depth = getattr(cfg, 'layer2_depth', 6)
+    layer3_depth = getattr(cfg, 'layer3_depth', 6)
     model = Pangu(
         img_size=cfg_data.dataset.img_size,
         patch_size=cfg.patch_size,
         embed_dim=cfg.embed_dim,
         num_heads=cfg.num_heads,
         window_size=cfg.window_size,
+        layer2_depth=layer2_depth,
+        layer3_depth=layer3_depth,
     ).to(device=device, dtype=infer_dtype)
-    missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+    # 剪枝兼容：过滤掉 checkpoint 中不属于剪枝后模型的参数
+    model_sd = model.state_dict()
+    pruned_state = {k: v for k, v in model_state.items() if k in model_sd and model_sd[k].shape == v.shape}
+    pruned_skipped = [k for k in model_state if k not in model_sd]
+    missing_keys, unexpected_keys = model.load_state_dict(pruned_state, strict=False)
     bad_missing = [key for key in missing_keys if "attn_mask" not in key]
-    if bad_missing or unexpected_keys:
+    if bad_missing:
         raise RuntimeError(
             "Checkpoint did not match model. "
-            f"bad_missing={bad_missing[:20]}, unexpected={unexpected_keys[:20]}"
+            f"bad_missing={bad_missing[:20]}"
         )
+    if pruned_skipped:
+        print(f"✂️  跳过 {len(pruned_skipped)} 个被剪枝参数: {pruned_skipped[:5]}")
     if missing_keys:
         print(f"recreated {len(missing_keys)} attn_mask buffers from model init")
     model.eval()
@@ -190,7 +201,8 @@ if __name__ == "__main__":
 
             invar_surface = invar[:, :4, :, :].to(device=device, dtype=infer_dtype)
             invar_upper_air = invar[:, 4:, :, :].to(device=device, dtype=infer_dtype)
-            invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
+            batch_surface_mask = surface_mask.expand(invar_surface.shape[0], -1, -1, -1)
+            invar = torch.concat([invar_surface, batch_surface_mask, invar_upper_air], dim=1)
 
             #----------------------AI4S(time measurement, do not move)---------------------------
             start_time = time.perf_counter()

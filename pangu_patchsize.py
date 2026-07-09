@@ -26,8 +26,11 @@ from onescience.modules import (
 class PanguPatchSize(nn.Module):
     """
     与 Pangu 完全等价，唯一区别：
-    patchrecovery2d / patchrecovery3d 的 patch_size 从构造参数推导，
-    而非硬编码为 (4,4) / (2,4,4)。
+    1. patchrecovery2d / patchrecovery3d 的 patch_size 从构造参数推导，
+       而非硬编码为 (4,4) / (2,4,4)。
+    2. 支持 layer2_depth / layer3_depth 参数进行 block 级剪枝。
+       剪枝时保留前 N 个 block（block0 ~ block(N-1)），
+       后续 block 被移除，减少计算量与参数量。
     """
 
     def __init__(
@@ -37,9 +40,13 @@ class PanguPatchSize(nn.Module):
         embed_dim=192,
         num_heads=(6, 12, 12, 6),
         window_size=(2, 6, 12),
+        layer2_depth=6,
+        layer3_depth=6,
     ):
         super().__init__()
         drop_path = np.linspace(0, 0.2, 8).tolist()
+        self.layer2_depth = layer2_depth
+        self.layer3_depth = layer3_depth
 
         # ---- Patch Embedding（与原版一致）----
         self.patchembed2d = OneEmbedding(
@@ -90,19 +97,19 @@ class PanguPatchSize(nn.Module):
             style="PanguFuser",
             dim=embed_dim * 2,
             input_resolution=patched_downsampled_shape,
-            depth=6,
+            depth=layer2_depth,
             num_heads=num_heads[1],
             window_size=window_size,
-            drop_path=drop_path[2:],
+            drop_path=drop_path[2 : 2 + layer2_depth],
         )
         self.layer3 = OneFuser(
             style="PanguFuser",
             dim=embed_dim * 2,
             input_resolution=patched_downsampled_shape,
-            depth=6,
+            depth=layer3_depth,
             num_heads=num_heads[2],
             window_size=window_size,
-            drop_path=drop_path[2:],
+            drop_path=drop_path[2 : 2 + layer3_depth],
         )
         self.upsample = OneSample(
             style="PanguUpSample",
