@@ -295,6 +295,8 @@ def main():
             logger.info(f"skipping first {start_batch} batches to resume...")
         optimizer.zero_grad()
         for j, data in enumerate(current_dataloader):
+            if processed_batches >= train_max_batches:
+                break
             if epoch == start_epoch and j < start_batch:
                 logger.info(f"  skip progress: {j}/{start_batch} batches")
                 continue
@@ -344,19 +346,27 @@ def main():
 
         model.eval()
         valid_loss = 0
-        val_max_batches = int(os.environ.get("VAL_MAX_BATCHES", "400"))
-        val_total = len(val_dataloader)
-        if val_max_batches > 0 and val_max_batches < val_total:
-            val_stride = max(1, val_total // val_max_batches)
+        val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", os.environ.get("VAL_MAX_BATCHES", "50")))
+        val_dataset = val_dataloader.dataset
+        val_total_samples = len(val_dataset)
+        if val_max_samples > 0 and val_max_samples < val_total_samples:
+            val_indices = np.linspace(0, val_total_samples - 1, num=val_max_samples, dtype=np.int64).tolist()
+            current_val_dataloader = torch.utils.data.DataLoader(
+                Subset(val_dataset, val_indices),
+                batch_size=cfg_data.dataloader.batch_size,
+                num_workers=val_dataloader.num_workers,
+                pin_memory=val_dataloader.pin_memory,
+                drop_last=False,
+                shuffle=False,
+            )
         else:
-            val_stride = 1
-            val_max_batches = val_total
+            val_max_samples = val_total_samples
+            current_val_dataloader = val_dataloader
+        val_max_batches = len(current_val_dataloader)
         val_processed = 0
         with torch.no_grad():
             start_time = time.time()
-            for j, data in enumerate(val_dataloader):
-                if val_stride > 1 and j % val_stride != 0:
-                    continue
+            for j, data in enumerate(current_val_dataloader):
                 invar = data[0]
                 outvar = data[1]
                 invar_surface = invar[:, :4, :, :].to(local_rank, dtype=torch.float32)
@@ -365,12 +375,11 @@ def main():
                 tar_surface = outvar[:, :4, :, :].to(local_rank, dtype=torch.float32)
                 tar_upper_air = outvar[:, 4:, :, :].to(local_rank, dtype=torch.float32)
 
-                with replace_function(raw_model,["layer2", "layer3"],cfg.world_size > 1):
-                    with autocast(dtype=torch.bfloat16):
-                        out_surface, out_upper_air = model(invar)
-                        out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
-                        loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25).item()
-                        loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0).item()
+                with autocast(dtype=torch.bfloat16):
+                    out_surface, out_upper_air = model(invar)
+                    out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
+                    loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25).item()
+                    loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0).item()
                 # 总 loss
                 loss = loss1 + loss2
 
@@ -381,9 +390,11 @@ def main():
                 valid_loss += loss
                 val_processed += 1
                 if world_rank == 0:
+                    seen_samples = min(val_processed * cfg_data.dataloader.batch_size, val_max_samples)
                     logger.info(f'Valid: Epoch {epoch}-{val_processed}/{val_max_batches} '
                             f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
                             f'[{(time.time()-start_time)/val_processed: .02f}s/{cfg_data.dataloader.batch_size}batch] '
+                            f'samples:{seen_samples}/{val_max_samples} '
                             f'loss:{valid_loss / val_processed: .04f}')
                 
         valid_loss /= max(1, val_processed)
@@ -450,3 +461,5 @@ if __name__ == "__main__":
     current_path = os.getcwd()
     sys.path.append(current_path)
     main()
+
+
