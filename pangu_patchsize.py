@@ -3,7 +3,7 @@ Pangu 模型的 patch_size 扩展版本。
 
 继承 onescience.models.pangu.Pangu，修复原版 __init__ 中
 patchrecovery2d / patchrecovery3d 的 patch_size 硬编码问题，
-使其从构造参数动态传入，支持 [2,6,6] 等非默认 patch_size。
+使其从构造参数动态传入，支持 [2,8,8] 等非默认 patch_size。
 
 用法：
     from pangu_patchsize import PanguPatchSize as Pangu
@@ -33,7 +33,7 @@ class PanguPatchSize(nn.Module):
     def __init__(
         self,
         img_size=(721, 1440),
-        patch_size=(2, 6, 6),
+        patch_size=(2, 8, 8),
         embed_dim=192,
         num_heads=(6, 12, 12, 6),
         window_size=(2, 6, 12),

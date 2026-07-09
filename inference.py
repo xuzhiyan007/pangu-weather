@@ -8,8 +8,8 @@ import torch
 from tqdm import tqdm
 
 from onescience.datapipes.climate import ERA5Datapipe
-from onescience.models.pangu import Pangu
 from onescience.utils.YParams import YParams
+from pangu_patchsize import PanguPatchSize as Pangu
 
 
 POSITION_BIAS_NAME = "earth_position_bias_table"
@@ -29,7 +29,7 @@ def get_stats(data_dir, channels):
 def find_checkpoint(checkpoint_dir):
     candidates = [
         os.environ.get("LIGHT_CKPT"),
-        os.path.join(checkpoint_dir, "model_light_int8_bf16_mlpint8.pth"),
+        os.path.join(checkpoint_dir, "model_288_light_int8_bf16_mlpint8.pth"),
     ]
     for path in candidates:
         if path and os.path.exists(path):
@@ -145,7 +145,7 @@ if __name__ == "__main__":
     topography = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "topography.npy")).astype(np.float32))
     topography = (topography - topography.mean()) / (topography.std(unbiased=False) + 1e-6)
     surface_mask = torch.stack([land_mask, soil_type, topography], dim=0).to(device=device, dtype=infer_dtype)
-    surface_mask = surface_mask.unsqueeze(0).repeat(cfg_data.dataloader.batch_size, 1, 1, 1)
+    surface_mask = surface_mask.unsqueeze(0)
 
     ckpt_path = find_checkpoint(cfg.checkpoint_dir)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -190,7 +190,8 @@ if __name__ == "__main__":
 
             invar_surface = invar[:, :4, :, :].to(device=device, dtype=infer_dtype)
             invar_upper_air = invar[:, 4:, :, :].to(device=device, dtype=infer_dtype)
-            invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
+            batch_surface_mask = surface_mask.expand(invar_surface.shape[0], -1, -1, -1)
+            invar = torch.concat([invar_surface, batch_surface_mask, invar_upper_air], dim=1)
 
             #----------------------AI4S(time measurement, do not move)---------------------------
             start_time = time.perf_counter()
