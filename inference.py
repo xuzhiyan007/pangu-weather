@@ -1,3 +1,14 @@
+"""
+教师模型推理脚本（embed_dim=192）。
+
+用法：
+    python inference1.py
+
+权重查找顺序：
+    1. 环境变量 LIGHT_CKPT
+    2. data/checkpoints/model_288_light_int8_bf16_mlpint8.pth
+"""
+
 import json
 import os
 import sys
@@ -136,6 +147,8 @@ if __name__ == "__main__":
     device = torch.device("cuda:0")
     infer_dtype = torch.bfloat16
 
+    print("📚 使用教师模型推理 (embed_dim=192)")
+
     means, stds = get_stats(cfg_data.dataset.data_dir, cfg_data.dataset.channels)
     datapipe = ERA5Datapipe(params=cfg_data, distributed=False)
     test_dataloader = datapipe.test_dataloader()
@@ -147,16 +160,20 @@ if __name__ == "__main__":
     surface_mask = torch.stack([land_mask, soil_type, topography], dim=0).to(device=device, dtype=infer_dtype)
     surface_mask = surface_mask.unsqueeze(0)
 
+    # ---- 加载教师模型权重（light checkpoint）----
     ckpt_path = find_checkpoint(cfg.checkpoint_dir)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model_state = unpack_light_checkpoint(ckpt, infer_dtype=infer_dtype)
 
+    # ---- 构建模型 ----
+    model_depth = cfg.depth if hasattr(cfg, 'depth') else (2, 6, 6, 2)
     model = Pangu(
         img_size=cfg_data.dataset.img_size,
         patch_size=cfg.patch_size,
         embed_dim=cfg.embed_dim,
         num_heads=cfg.num_heads,
         window_size=cfg.window_size,
+        depth=model_depth,
     ).to(device=device, dtype=infer_dtype)
     missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
     bad_missing = [key for key in missing_keys if "attn_mask" not in key]
