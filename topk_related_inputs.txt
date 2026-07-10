@@ -1,0 +1,402 @@
+Overall input-variable ranking by mean abs correlation to target15
+01. geopotential_300                    mean_abs_corr=0.621797
+02. geopotential_400                    mean_abs_corr=0.621713
+03. geopotential_250                    mean_abs_corr=0.621308
+04. geopotential_500                    mean_abs_corr=0.620272
+05. geopotential_200                    mean_abs_corr=0.618864
+06. geopotential_600                    mean_abs_corr=0.616333
+07. geopotential_150                    mean_abs_corr=0.609047
+08. geopotential_700                    mean_abs_corr=0.605973
+09. temperature_500                     mean_abs_corr=0.600842
+10. temperature_400                     mean_abs_corr=0.600769
+11. temperature_600                     mean_abs_corr=0.596949
+12. temperature_700                     mean_abs_corr=0.590329
+13. temperature_850                     mean_abs_corr=0.588255
+14. temperature_925                     mean_abs_corr=0.580197
+15. temperature_300                     mean_abs_corr=0.578444
+16. geopotential_100                    mean_abs_corr=0.569278
+17. temperature_1000                    mean_abs_corr=0.567584
+18. specific_humidity_1000              mean_abs_corr=0.560149
+19. 2m_temperature                      mean_abs_corr=0.559046
+20. specific_humidity_925               mean_abs_corr=0.558618
+21. geopotential_850                    mean_abs_corr=0.553776
+22. specific_humidity_850               mean_abs_corr=0.535537
+23. geopotential_925                    mean_abs_corr=0.486035
+24. specific_humidity_700               mean_abs_corr=0.474846
+25. temperature_250                     mean_abs_corr=0.473723
+26. specific_humidity_150               mean_abs_corr=0.453196
+27. specific_humidity_200               mean_abs_corr=0.447462
+28. geopotential_50                     mean_abs_corr=0.445684
+29. specific_humidity_600               mean_abs_corr=0.439094
+30. specific_humidity_250               mean_abs_corr=0.420388
+31. specific_humidity_500               mean_abs_corr=0.406172
+32. specific_humidity_300               mean_abs_corr=0.400468
+33. specific_humidity_400               mean_abs_corr=0.385893
+34. geopotential_1000                   mean_abs_corr=0.367654
+35. temperature_100                     mean_abs_corr=0.341154
+36. u_component_of_wind_50              mean_abs_corr=0.328301
+37. mean_sea_level_pressure             mean_abs_corr=0.303267
+38. temperature_150                     mean_abs_corr=0.240108
+39. 10m_u_component_of_wind             mean_abs_corr=0.209680
+40. u_component_of_wind_100             mean_abs_corr=0.205504
+41. u_component_of_wind_1000            mean_abs_corr=0.204164
+42. u_component_of_wind_925             mean_abs_corr=0.196946
+43. u_component_of_wind_850             mean_abs_corr=0.191324
+44. u_component_of_wind_700             mean_abs_corr=0.174505
+45. u_component_of_wind_600             mean_abs_corr=0.172362
+46. u_component_of_wind_500             mean_abs_corr=0.159223
+47. u_component_of_wind_200             mean_abs_corr=0.150378
+48. u_component_of_wind_250             mean_abs_corr=0.143552
+49. u_component_of_wind_400             mean_abs_corr=0.137737
+50. u_component_of_wind_300             mean_abs_corr=0.135613
+51. u_component_of_wind_150             mean_abs_corr=0.135079
+52. temperature_200                     mean_abs_corr=0.132819
+53. 10m_v_component_of_wind             mean_abs_corr=0.109700
+54. v_component_of_wind_1000            mean_abs_corr=0.107307
+55. v_component_of_wind_925             mean_abs_corr=0.107176
+56. v_component_of_wind_850             mean_abs_corr=0.106980
+57. specific_humidity_100               mean_abs_corr=0.105802
+58. v_component_of_wind_700             mean_abs_corr=0.099058
+59. v_component_of_wind_600             mean_abs_corr=0.095597
+60. v_component_of_wind_500             mean_abs_corr=0.090269
+61. specific_humidity_50                mean_abs_corr=0.082907
+62. v_component_of_wind_400             mean_abs_corr=0.081644
+63. v_component_of_wind_300             mean_abs_corr=0.072842
+64. v_component_of_wind_250             mean_abs_corr=0.067320
+65. v_component_of_wind_200             mean_abs_corr=0.061270
+66. v_component_of_wind_150             mean_abs_corr=0.056806
+67. temperature_50                      mean_abs_corr=0.055399
+68. v_component_of_wind_100             mean_abs_corr=0.052899
+69. v_component_of_wind_50              mean_abs_corr=0.035338
+
+Per-target top variables
+
+[target] mean_sea_level_pressure
+01. mean_sea_level_pressure             corr= 0.981200 abs=0.981200
+02. geopotential_1000                   corr= 0.962445 abs=0.962445
+03. geopotential_925                    corr= 0.900208 abs=0.900208
+04. geopotential_850                    corr= 0.808264 abs=0.808264
+05. geopotential_700                    corr= 0.650173 abs=0.650173
+06. geopotential_600                    corr= 0.575106 abs=0.575106
+07. geopotential_500                    corr= 0.520046 abs=0.520046
+08. geopotential_400                    corr= 0.476404 abs=0.476404
+09. geopotential_300                    corr= 0.442111 abs=0.442111
+10. geopotential_250                    corr= 0.429060 abs=0.429060
+11. geopotential_100                    corr= 0.423048 abs=0.423048
+12. geopotential_200                    corr= 0.420090 abs=0.420090
+13. geopotential_150                    corr= 0.418581 abs=0.418581
+14. geopotential_50                     corr= 0.375323 abs=0.375323
+15. u_component_of_wind_50              corr=-0.335319 abs=0.335319
+16. temperature_400                     corr= 0.280733 abs=0.280733
+17. temperature_500                     corr= 0.280567 abs=0.280567
+18. temperature_600                     corr= 0.276075 abs=0.276075
+19. temperature_300                     corr= 0.266417 abs=0.266417
+20. temperature_700                     corr= 0.251083 abs=0.251083
+
+[target] 10m_u_component_of_wind
+01. 10m_u_component_of_wind             corr= 0.917517 abs=0.917517
+02. u_component_of_wind_1000            corr= 0.911265 abs=0.911265
+03. u_component_of_wind_925             corr= 0.879797 abs=0.879797
+04. u_component_of_wind_850             corr= 0.829706 abs=0.829706
+05. u_component_of_wind_700             corr= 0.692851 abs=0.692851
+06. u_component_of_wind_600             corr= 0.608397 abs=0.608397
+07. u_component_of_wind_500             corr= 0.528065 abs=0.528065
+08. u_component_of_wind_400             corr= 0.441202 abs=0.441202
+09. u_component_of_wind_300             corr= 0.357951 abs=0.357951
+10. u_component_of_wind_250             corr= 0.318236 abs=0.318236
+11. u_component_of_wind_50              corr= 0.310676 abs=0.310676
+12. u_component_of_wind_100             corr= 0.309414 abs=0.309414
+13. u_component_of_wind_200             corr= 0.274069 abs=0.274069
+14. temperature_100                     corr= 0.261305 abs=0.261305
+15. u_component_of_wind_150             corr= 0.248605 abs=0.248605
+16. temperature_150                     corr= 0.229714 abs=0.229714
+17. specific_humidity_1000              corr=-0.198831 abs=0.198831
+18. geopotential_400                    corr=-0.195703 abs=0.195703
+19. geopotential_300                    corr=-0.195268 abs=0.195268
+20. geopotential_700                    corr=-0.194916 abs=0.194916
+
+[target] 10m_v_component_of_wind
+01. 10m_v_component_of_wind             corr= 0.863330 abs=0.863330
+02. v_component_of_wind_1000            corr= 0.857469 abs=0.857469
+03. v_component_of_wind_925             corr= 0.797670 abs=0.797670
+04. v_component_of_wind_850             corr= 0.705529 abs=0.705529
+05. v_component_of_wind_700             corr= 0.532191 abs=0.532191
+06. v_component_of_wind_600             corr= 0.430510 abs=0.430510
+07. v_component_of_wind_500             corr= 0.343983 abs=0.343983
+08. v_component_of_wind_400             corr= 0.265251 abs=0.265251
+09. v_component_of_wind_300             corr= 0.195632 abs=0.195632
+10. v_component_of_wind_250             corr= 0.158027 abs=0.158027
+11. v_component_of_wind_200             corr= 0.120165 abs=0.120165
+12. v_component_of_wind_100             corr= 0.108513 abs=0.108513
+13. v_component_of_wind_150             corr= 0.099178 abs=0.099178
+14. v_component_of_wind_50              corr= 0.074982 abs=0.074982
+15. u_component_of_wind_600             corr=-0.064990 abs=0.064990
+16. u_component_of_wind_200             corr=-0.063122 abs=0.063122
+17. u_component_of_wind_250             corr=-0.061850 abs=0.061850
+18. u_component_of_wind_150             corr=-0.060920 abs=0.060920
+19. u_component_of_wind_500             corr=-0.060098 abs=0.060098
+20. u_component_of_wind_300             corr=-0.059313 abs=0.059313
+
+[target] 2m_temperature
+01. 2m_temperature                      corr= 0.992836 abs=0.992836
+02. temperature_700                     corr= 0.949673 abs=0.949673
+03. temperature_850                     corr= 0.948807 abs=0.948807
+04. temperature_1000                    corr= 0.947585 abs=0.947585
+05. temperature_925                     corr= 0.946651 abs=0.946651
+06. temperature_600                     corr= 0.924482 abs=0.924482
+07. geopotential_200                    corr= 0.906568 abs=0.906568
+08. temperature_500                     corr= 0.906292 abs=0.906292
+09. geopotential_150                    corr= 0.905880 abs=0.905880
+10. geopotential_250                    corr= 0.903961 abs=0.903961
+11. geopotential_300                    corr= 0.901081 abs=0.901081
+12. geopotential_400                    corr= 0.895247 abs=0.895247
+13. temperature_400                     corr= 0.894207 abs=0.894207
+14. geopotential_500                    corr= 0.884977 abs=0.884977
+15. geopotential_100                    corr= 0.876267 abs=0.876267
+16. temperature_300                     corr= 0.868978 abs=0.868978
+17. geopotential_600                    corr= 0.864849 abs=0.864849
+18. geopotential_700                    corr= 0.824825 abs=0.824825
+19. specific_humidity_1000              corr= 0.809145 abs=0.809145
+20. specific_humidity_925               corr= 0.798332 abs=0.798332
+
+[target] geopotential_850
+01. geopotential_850                    corr= 0.992182 abs=0.992182
+02. geopotential_925                    corr= 0.970627 abs=0.970627
+03. geopotential_700                    corr= 0.960947 abs=0.960947
+04. geopotential_600                    corr= 0.931557 abs=0.931557
+05. geopotential_500                    corr= 0.905146 abs=0.905146
+06. geopotential_400                    corr= 0.881246 abs=0.881246
+07. geopotential_1000                   corr= 0.878425 abs=0.878425
+08. geopotential_300                    corr= 0.860697 abs=0.860697
+09. geopotential_250                    corr= 0.852282 abs=0.852282
+10. geopotential_200                    corr= 0.845044 abs=0.845044
+11. geopotential_150                    corr= 0.838325 abs=0.838325
+12. geopotential_100                    corr= 0.813131 abs=0.813131
+13. mean_sea_level_pressure             corr= 0.812753 abs=0.812753
+14. temperature_600                     corr= 0.753945 abs=0.753945
+15. temperature_500                     corr= 0.751447 abs=0.751447
+16. temperature_400                     corr= 0.745292 abs=0.745292
+17. temperature_700                     corr= 0.741424 abs=0.741424
+18. temperature_850                     corr= 0.729290 abs=0.729290
+19. temperature_925                     corr= 0.715740 abs=0.715740
+20. temperature_300                     corr= 0.712534 abs=0.712534
+
+[target] geopotential_700
+01. geopotential_700                    corr= 0.996289 abs=0.996289
+02. geopotential_600                    corr= 0.990498 abs=0.990498
+03. geopotential_500                    corr= 0.979961 abs=0.979961
+04. geopotential_400                    corr= 0.967935 abs=0.967935
+05. geopotential_850                    corr= 0.965787 abs=0.965787
+06. geopotential_300                    corr= 0.955998 abs=0.955998
+07. geopotential_250                    corr= 0.950233 abs=0.950233
+08. geopotential_200                    corr= 0.943434 abs=0.943434
+09. geopotential_150                    corr= 0.932615 abs=0.932615
+10. geopotential_925                    corr= 0.896248 abs=0.896248
+11. geopotential_100                    corr= 0.891827 abs=0.891827
+12. temperature_600                     corr= 0.884789 abs=0.884789
+13. temperature_500                     corr= 0.882910 abs=0.882910
+14. temperature_400                     corr= 0.875460 abs=0.875460
+15. temperature_700                     corr= 0.874588 abs=0.874588
+16. temperature_850                     corr= 0.868691 abs=0.868691
+17. temperature_925                     corr= 0.856073 abs=0.856073
+18. temperature_1000                    corr= 0.837704 abs=0.837704
+19. temperature_300                     corr= 0.835118 abs=0.835118
+20. 2m_temperature                      corr= 0.821641 abs=0.821641
+
+[target] geopotential_500
+01. geopotential_500                    corr= 0.997571 abs=0.997571
+02. geopotential_600                    corr= 0.995368 abs=0.995368
+03. geopotential_400                    corr= 0.995225 abs=0.995225
+04. geopotential_300                    corr= 0.990239 abs=0.990239
+05. geopotential_250                    corr= 0.986552 abs=0.986552
+06. geopotential_700                    corr= 0.983550 abs=0.983550
+07. geopotential_200                    corr= 0.980286 abs=0.980286
+08. geopotential_150                    corr= 0.967145 abs=0.967145
+09. temperature_600                     corr= 0.950053 abs=0.950053
+10. temperature_500                     corr= 0.948684 abs=0.948684
+11. temperature_400                     corr= 0.939859 abs=0.939859
+12. temperature_700                     corr= 0.938821 abs=0.938821
+13. temperature_850                     corr= 0.929220 abs=0.929220
+14. geopotential_100                    corr= 0.917455 abs=0.917455
+15. temperature_925                     corr= 0.916847 abs=0.916847
+16. geopotential_850                    corr= 0.913683 abs=0.913683
+17. temperature_1000                    corr= 0.901907 abs=0.901907
+18. temperature_300                     corr= 0.893656 abs=0.893656
+19. 2m_temperature                      corr= 0.882151 abs=0.882151
+20. geopotential_925                    corr= 0.816195 abs=0.816195
+
+[target] specific_humidity_850
+01. specific_humidity_850               corr= 0.963925 abs=0.963925
+02. specific_humidity_925               corr= 0.935260 abs=0.935260
+03. specific_humidity_1000              corr= 0.913028 abs=0.913028
+04. specific_humidity_700               corr= 0.838323 abs=0.838323
+05. temperature_400                     corr= 0.821566 abs=0.821566
+06. temperature_300                     corr= 0.813883 abs=0.813883
+07. temperature_500                     corr= 0.807293 abs=0.807293
+08. geopotential_200                    corr= 0.794339 abs=0.794339
+09. geopotential_250                    corr= 0.793891 abs=0.793891
+10. geopotential_300                    corr= 0.786944 abs=0.786944
+11. temperature_600                     corr= 0.786785 abs=0.786785
+12. temperature_925                     corr= 0.783480 abs=0.783480
+13. temperature_1000                    corr= 0.775641 abs=0.775641
+14. geopotential_150                    corr= 0.773424 abs=0.773424
+15. temperature_850                     corr= 0.772342 abs=0.772342
+16. geopotential_400                    corr= 0.770063 abs=0.770063
+17. temperature_700                     corr= 0.767584 abs=0.767584
+18. specific_humidity_600               corr= 0.761999 abs=0.761999
+19. geopotential_500                    corr= 0.750617 abs=0.750617
+20. 2m_temperature                      corr= 0.742390 abs=0.742390
+
+[target] specific_humidity_700
+01. specific_humidity_700               corr= 0.943052 abs=0.943052
+02. specific_humidity_600               corr= 0.875307 abs=0.875307
+03. specific_humidity_850               corr= 0.829771 abs=0.829771
+04. specific_humidity_925               corr= 0.787865 abs=0.787865
+05. specific_humidity_500               corr= 0.774005 abs=0.774005
+06. specific_humidity_1000              corr= 0.768624 abs=0.768624
+07. specific_humidity_200               corr= 0.718083 abs=0.718083
+08. temperature_400                     corr= 0.704531 abs=0.704531
+09. specific_humidity_250               corr= 0.699888 abs=0.699888
+10. temperature_300                     corr= 0.696640 abs=0.696640
+11. specific_humidity_400               corr= 0.693024 abs=0.693024
+12. temperature_500                     corr= 0.686399 abs=0.686399
+13. specific_humidity_300               corr= 0.685444 abs=0.685444
+14. temperature_850                     corr= 0.676448 abs=0.676448
+15. temperature_925                     corr= 0.676355 abs=0.676355
+16. geopotential_200                    corr= 0.672164 abs=0.672164
+17. geopotential_250                    corr= 0.671273 abs=0.671273
+18. specific_humidity_150               corr= 0.669113 abs=0.669113
+19. geopotential_300                    corr= 0.664668 abs=0.664668
+20. temperature_600                     corr= 0.659404 abs=0.659404
+
+[target] specific_humidity_500
+01. specific_humidity_500               corr= 0.924579 abs=0.924579
+02. specific_humidity_400               corr= 0.840885 abs=0.840885
+03. specific_humidity_600               corr= 0.832594 abs=0.832594
+04. specific_humidity_300               corr= 0.766068 abs=0.766068
+05. specific_humidity_700               corr= 0.751199 abs=0.751199
+06. specific_humidity_250               corr= 0.737542 abs=0.737542
+07. specific_humidity_200               corr= 0.717346 abs=0.717346
+08. specific_humidity_850               corr= 0.679751 abs=0.679751
+09. specific_humidity_925               corr= 0.651979 abs=0.651979
+10. specific_humidity_1000              corr= 0.628914 abs=0.628914
+11. specific_humidity_150               corr= 0.623510 abs=0.623510
+12. temperature_400                     corr= 0.587509 abs=0.587509
+13. temperature_300                     corr= 0.580372 abs=0.580372
+14. temperature_500                     corr= 0.563212 abs=0.563212
+15. geopotential_250                    corr= 0.554684 abs=0.554684
+16. geopotential_200                    corr= 0.554337 abs=0.554337
+17. geopotential_300                    corr= 0.549156 abs=0.549156
+18. temperature_850                     corr= 0.541143 abs=0.541143
+19. temperature_600                     corr= 0.540191 abs=0.540191
+20. temperature_925                     corr= 0.540160 abs=0.540160
+
+[target] temperature_850
+01. temperature_850                     corr= 0.995002 abs=0.995002
+02. temperature_925                     corr= 0.984230 abs=0.984230
+03. temperature_700                     corr= 0.978845 abs=0.978845
+04. temperature_1000                    corr= 0.967691 abs=0.967691
+05. temperature_600                     corr= 0.963543 abs=0.963543
+06. temperature_500                     corr= 0.953490 abs=0.953490
+07. geopotential_250                    corr= 0.951673 abs=0.951673
+08. geopotential_300                    corr= 0.950779 abs=0.950779
+09. geopotential_200                    corr= 0.950286 abs=0.950286
+10. 2m_temperature                      corr= 0.948841 abs=0.948841
+11. geopotential_400                    corr= 0.945893 abs=0.945893
+12. temperature_400                     corr= 0.942419 abs=0.942419
+13. geopotential_150                    corr= 0.942159 abs=0.942159
+14. geopotential_500                    corr= 0.935648 abs=0.935648
+15. geopotential_600                    corr= 0.916209 abs=0.916209
+16. temperature_300                     corr= 0.902600 abs=0.902600
+17. geopotential_100                    corr= 0.897449 abs=0.897449
+18. geopotential_700                    corr= 0.877197 abs=0.877197
+19. specific_humidity_1000              corr= 0.829607 abs=0.829607
+20. specific_humidity_925               corr= 0.819170 abs=0.819170
+
+[target] temperature_700
+01. temperature_700                     corr= 0.995895 abs=0.995895
+02. temperature_600                     corr= 0.979636 abs=0.979636
+03. temperature_850                     corr= 0.977352 abs=0.977352
+04. temperature_500                     corr= 0.966403 abs=0.966403
+05. temperature_925                     corr= 0.961428 abs=0.961428
+06. geopotential_250                    corr= 0.960259 abs=0.960259
+07. geopotential_300                    corr= 0.960059 abs=0.960059
+08. geopotential_200                    corr= 0.957596 abs=0.957596
+09. geopotential_400                    corr= 0.955413 abs=0.955413
+10. temperature_400                     corr= 0.952531 abs=0.952531
+11. 2m_temperature                      corr= 0.948493 abs=0.948493
+12. temperature_1000                    corr= 0.948291 abs=0.948291
+13. geopotential_150                    corr= 0.947876 abs=0.947876
+14. geopotential_500                    corr= 0.944622 abs=0.944622
+15. geopotential_600                    corr= 0.923801 abs=0.923801
+16. temperature_300                     corr= 0.907027 abs=0.907027
+17. geopotential_100                    corr= 0.901307 abs=0.901307
+18. geopotential_700                    corr= 0.882823 abs=0.882823
+19. specific_humidity_1000              corr= 0.826513 abs=0.826513
+20. specific_humidity_925               corr= 0.819065 abs=0.819065
+
+[target] temperature_500
+01. temperature_500                     corr= 0.994541 abs=0.994541
+02. temperature_400                     corr= 0.988349 abs=0.988349
+03. temperature_600                     corr= 0.986641 abs=0.986641
+04. geopotential_250                    corr= 0.978889 abs=0.978889
+05. geopotential_300                    corr= 0.978349 abs=0.978349
+06. geopotential_200                    corr= 0.973859 abs=0.973859
+07. geopotential_400                    corr= 0.969732 abs=0.969732
+08. temperature_700                     corr= 0.964565 abs=0.964565
+09. geopotential_150                    corr= 0.956267 abs=0.956267
+10. geopotential_500                    corr= 0.954167 abs=0.954167
+11. temperature_850                     corr= 0.950623 abs=0.950623
+12. temperature_925                     corr= 0.940758 abs=0.940758
+13. temperature_300                     corr= 0.935807 abs=0.935807
+14. temperature_1000                    corr= 0.933777 abs=0.933777
+15. geopotential_600                    corr= 0.930494 abs=0.930494
+16. 2m_temperature                      corr= 0.904211 abs=0.904211
+17. geopotential_700                    corr= 0.892167 abs=0.892167
+18. geopotential_100                    corr= 0.891209 abs=0.891209
+19. specific_humidity_1000              corr= 0.865119 abs=0.865119
+20. specific_humidity_925               corr= 0.857634 abs=0.857634
+
+[target] u_component_of_wind_500
+01. u_component_of_wind_500             corr= 0.944033 abs=0.944033
+02. u_component_of_wind_600             corr= 0.920610 abs=0.920610
+03. u_component_of_wind_400             corr= 0.909239 abs=0.909239
+04. u_component_of_wind_700             corr= 0.855833 abs=0.855833
+05. u_component_of_wind_300             corr= 0.846993 abs=0.846993
+06. u_component_of_wind_250             corr= 0.809021 abs=0.809021
+07. u_component_of_wind_200             corr= 0.757442 abs=0.757442
+08. u_component_of_wind_850             corr= 0.715234 abs=0.715234
+09. u_component_of_wind_150             corr= 0.701353 abs=0.701353
+10. u_component_of_wind_100             corr= 0.658751 abs=0.658751
+11. u_component_of_wind_925             corr= 0.634324 abs=0.634324
+12. u_component_of_wind_1000            corr= 0.574078 abs=0.574078
+13. 10m_u_component_of_wind             corr= 0.571013 abs=0.571013
+14. u_component_of_wind_50              corr= 0.381486 abs=0.381486
+15. specific_humidity_150               corr=-0.205988 abs=0.205988
+16. temperature_100                     corr= 0.195159 abs=0.195159
+17. specific_humidity_1000              corr=-0.182763 abs=0.182763
+18. specific_humidity_850               corr=-0.181198 abs=0.181198
+19. specific_humidity_925               corr=-0.179028 abs=0.179028
+20. specific_humidity_200               corr=-0.175195 abs=0.175195
+
+[target] v_component_of_wind_500
+01. v_component_of_wind_500             corr= 0.864373 abs=0.864373
+02. v_component_of_wind_600             corr= 0.847470 abs=0.847470
+03. v_component_of_wind_400             corr= 0.818203 abs=0.818203
+04. v_component_of_wind_700             corr= 0.786973 abs=0.786973
+05. v_component_of_wind_300             corr= 0.754638 abs=0.754638
+06. v_component_of_wind_250             corr= 0.711649 abs=0.711649
+07. v_component_of_wind_850             corr= 0.648461 abs=0.648461
+08. v_component_of_wind_200             corr= 0.646799 abs=0.646799
+09. v_component_of_wind_150             corr= 0.580442 abs=0.580442
+10. v_component_of_wind_925             corr= 0.564685 abs=0.564685
+11. v_component_of_wind_100             corr= 0.524707 abs=0.524707
+12. v_component_of_wind_1000            corr= 0.492054 abs=0.492054
+13. 10m_v_component_of_wind             corr= 0.488920 abs=0.488920
+14. v_component_of_wind_50              corr= 0.306982 abs=0.306982
+15. 10m_u_component_of_wind             corr= 0.032921 abs=0.032921
+16. u_component_of_wind_1000            corr= 0.027151 abs=0.027151
+17. temperature_150                     corr= 0.018718 abs=0.018718
+18. temperature_200                     corr= 0.018521 abs=0.018521
+19. temperature_850                     corr=-0.016489 abs=0.016489
+20. temperature_700                     corr=-0.015107 abs=0.015107
