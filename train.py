@@ -101,11 +101,15 @@ def main():
                   window_size=cfg.window_size,
                   depth=cfg.depth,
                   ).to(local_rank)
-    
+
+    ## 剪枝检测
+    is_pruned = (cfg.depth[1] < 6 or cfg.depth[2] < 6)
+    ckpt_suffix = "_pruned" if is_pruned else ""
+
     ## Train process init
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    train_loss_file = f"{cfg.checkpoint_dir}/trloss_288.npy"
-    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_288.npy"
+    train_loss_file = f"{cfg.checkpoint_dir}/trloss_288{ckpt_suffix}.npy"
+    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_288{ckpt_suffix}.npy"
     best_valid_loss = 1.0e6
     best_loss_epoch = 0
     train_losses = np.empty((0,), dtype=np.float32)
@@ -117,11 +121,15 @@ def main():
         print("\n\n")
         print("-" * 50)
         print(f"📂 now params is {total_params}, {total_params / 1e6:.2f}M, {total_params / 1e9:.2f}B")
+        if is_pruned:
+            pruned_l2 = 6 - cfg.depth[1]
+            pruned_l3 = 6 - cfg.depth[2]
+            print(f"✂️  Block 剪枝已启用: layer2={cfg.depth[1]}/6 (剪{pruned_l2}), layer3={cfg.depth[2]}/6 (剪{pruned_l3})")
         print("-" * 50, "\n")
 
     ## Checkpoint file names
-    best_ckpt_name = "model_288_bak.pth"
-    latest_ckpt_name = "model_288_latest.pth"
+    best_ckpt_name = f"model_288{ckpt_suffix}_bak.pth"
+    latest_ckpt_name = f"model_288{ckpt_suffix}_latest.pth"
     best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
     save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "60"))
@@ -144,7 +152,14 @@ def main():
             print(f'删除此文件可重新从全量模型 warm start')
             print("-" * 50 + "\n")
         ckpt = torch.load(resume_ckpt, map_location=f'cuda:{local_rank}', weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        # 剪枝兼容：过滤掉 checkpoint 中不属于剪枝后模型的参数
+        model_state = model.state_dict()
+        src_state = ckpt["model_state_dict"]
+        filtered_state = {k: v for k, v in src_state.items() if k in model_state and model_state[k].shape == v.shape}
+        skipped_keys = [k for k in src_state if k not in model_state or (k in model_state and model_state[k].shape != src_state[k].shape)]
+        missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
+        if world_rank == 0 and skipped_keys:
+            print(f"✂️  续训跳过 {len(skipped_keys)} 个被剪枝参数: {skipped_keys[:5]}")
         resume_ckpt_data = ckpt
         best_valid_loss = ckpt.get("best_valid_loss", best_valid_loss)
         best_loss_epoch = ckpt.get("best_loss_epoch", best_loss_epoch)
@@ -178,12 +193,15 @@ def main():
         model_state = model.state_dict()
         filtered_state = {}
         shape_mismatch_keys = []
+        pruned_keys = []
         for k, v in src_state.items():
             if k in model_state:
                 if model_state[k].shape == v.shape:
                     filtered_state[k] = v
                 else:
                     shape_mismatch_keys.append(k)
+            else:
+                pruned_keys.append(k)
 
         missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
         real_missing = [k for k in missing_keys if "attn_mask" not in k]
@@ -193,6 +211,9 @@ def main():
             if shape_mismatch_keys:
                 print(f"⚠️  {len(shape_mismatch_keys)} 个参数因 patch_size 变更跳过（形状不匹配）:")
                 print(f"   {shape_mismatch_keys[:10]}")
+            if pruned_keys:
+                print(f"✂️  {len(pruned_keys)} 个参数因剪枝跳过（被移除的 block）:")
+                print(f"   {pruned_keys[:10]}")
             print(f"   {len(real_missing)} 个参数随机初始化（patch_embed/recovery/downsample/upsample）")
             print(f"   attn_mask buffer {len(attn_mask_missing)} 个将自动重建")
             if real_missing:
@@ -203,11 +224,22 @@ def main():
         start_epoch = 0
         start_batch = 0
 
-    # ---- Step 2: 无论哪种加载方式，都冻结 Transformer 层 ----
+    # ---- Step 2: 冻结策略（剪枝感知）----
+    if is_pruned:
+        # 剪枝模式：冻结 layer1，解冻 layer2/3/4（剪枝改变了结构，需重新训练）
+        frozen_layers = ["layer1"]
+        trainable_layers = ["layer2", "layer3", "layer4"]
+    else:
+        # 非剪枝模式：冻结所有 Transformer 层（原版行为）
+        frozen_layers = ["layer1", "layer2", "layer3", "layer4"]
+        trainable_layers = []
+
     freeze_transformer = True
     for name, param in model.named_parameters():
-        if any(layer in name for layer in ["layer1", "layer2", "layer3", "layer4"]):
+        if any(layer in name for layer in frozen_layers):
             param.requires_grad = False
+        elif any(layer in name for layer in trainable_layers):
+            param.requires_grad = True
 
     # 解冻 earth_position_bias_table（形状因 patch_size 变更，需要从头学习）
     for name, param in model.named_parameters():
@@ -217,7 +249,10 @@ def main():
     if world_rank == 0:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
-        print(f"🧊 Transformer 已冻结（QKV/MLP/LayerNorm），仅训练 {trainable}/{total} 参数 ({trainable/total*100:.1f}%)")
+        if is_pruned:
+            print(f"🔥 剪枝感知冻结：layer1 已冻结，layer2/3/4 已解冻微调，仅训练 {trainable}/{total} 参数 ({trainable/total*100:.1f}%)")
+        else:
+            print(f"🧊 Transformer 已冻结（QKV/MLP/LayerNorm），仅训练 {trainable}/{total} 参数 ({trainable/total*100:.1f}%)")
         print(f"   earth_position_bias_table 已单独解冻，将从 trunc_normal 初始化开始学习")
         if unfreeze_epoch < 999:
             print(f"   将在 epoch {unfreeze_epoch} 解冻全部参数")

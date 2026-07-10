@@ -2,11 +2,11 @@
 教师模型推理脚本（embed_dim=192）。
 
 用法：
-    python inference1.py
+    python inference.py
 
 权重查找顺序：
     1. 环境变量 LIGHT_CKPT
-    2. data/checkpoints/model_288_light_int8_bf16_mlpint8.pth
+    2. data/checkpoints/model_288_pruned_light_int8_bf16_mlpint8.pth
 """
 
 import json
@@ -40,7 +40,7 @@ def get_stats(data_dir, channels):
 def find_checkpoint(checkpoint_dir):
     candidates = [
         os.environ.get("LIGHT_CKPT"),
-        os.path.join(checkpoint_dir, "model_288_light_int8_bf16_mlpint8.pth"),
+        os.path.join(checkpoint_dir, "model_288_pruned_light_int8_bf16_mlpint8.pth"),
     ]
     for path in candidates:
         if path and os.path.exists(path):
@@ -175,13 +175,19 @@ if __name__ == "__main__":
         window_size=cfg.window_size,
         depth=model_depth,
     ).to(device=device, dtype=infer_dtype)
-    missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+    # 剪枝兼容：过滤掉 checkpoint 中不属于剪枝后模型的参数
+    model_sd = model.state_dict()
+    pruned_state = {k: v for k, v in model_state.items() if k in model_sd and model_sd[k].shape == v.shape}
+    pruned_skipped = [k for k in model_state if k not in model_sd or (k in model_sd and model_sd[k].shape != model_state[k].shape)]
+    missing_keys, unexpected_keys = model.load_state_dict(pruned_state, strict=False)
     bad_missing = [key for key in missing_keys if "attn_mask" not in key]
-    if bad_missing or unexpected_keys:
+    if bad_missing:
         raise RuntimeError(
             "Checkpoint did not match model. "
-            f"bad_missing={bad_missing[:20]}, unexpected={unexpected_keys[:20]}"
+            f"bad_missing={bad_missing[:20]}"
         )
+    if pruned_skipped:
+        print(f"✂️  跳过 {len(pruned_skipped)} 个被剪枝参数: {pruned_skipped[:5]}")
     if missing_keys:
         print(f"recreated {len(missing_keys)} attn_mask buffers from model init")
     model.eval()

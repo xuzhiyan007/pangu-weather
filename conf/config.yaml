@@ -5,7 +5,10 @@ model:
     embed_dim: 192
     num_heads: [6, 12, 12, 6]
     window_size: [2, 6, 12]
-    depth: [2, 6, 6, 2]
+    # ---- block 级剪枝配置 ----
+    # depth 控制各 Transformer layer 的 block 数量（原版 [2, 6, 6, 2]）
+    # 方案A: layer3_depth=3（剪掉 block3/4/5，保留 block0/1/2）
+    depth: [2, 6, 3, 2]
     patience: 50
     checkpoint_dir: "./data/checkpoints"         # AI4S，路径不可更改
 

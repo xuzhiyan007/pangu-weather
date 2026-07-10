@@ -37,9 +37,16 @@ class PanguPatchSize(nn.Module):
         embed_dim=192,
         num_heads=(6, 12, 12, 6),
         window_size=(2, 6, 12),
+        depth=(2, 6, 6, 2),
     ):
         super().__init__()
+        self.depth = tuple(depth)
         drop_path = np.linspace(0, 0.2, 8).tolist()
+
+        # ---- block 级剪枝信息 ----
+        is_pruned = self.depth[1] < 6 or self.depth[2] < 6
+        if is_pruned:
+            print(f"✂️  PanguPatchSize 剪枝: layer2={self.depth[1]}/6, layer3={self.depth[2]}/6")
 
         # ---- Patch Embedding（与原版一致）----
         self.patchembed2d = OneEmbedding(
@@ -68,10 +75,10 @@ class PanguPatchSize(nn.Module):
             style="PanguFuser",
             dim=embed_dim,
             input_resolution=patched_input_shape,
-            depth=2,
+            depth=self.depth[0],
             num_heads=num_heads[0],
             window_size=window_size,
-            drop_path=drop_path[:2],
+            drop_path=drop_path[:self.depth[0]],
         )
 
         patched_downsampled_shape = (
@@ -90,19 +97,19 @@ class PanguPatchSize(nn.Module):
             style="PanguFuser",
             dim=embed_dim * 2,
             input_resolution=patched_downsampled_shape,
-            depth=6,
+            depth=self.depth[1],
             num_heads=num_heads[1],
             window_size=window_size,
-            drop_path=drop_path[2:],
+            drop_path=drop_path[2 : 2 + self.depth[1]],
         )
         self.layer3 = OneFuser(
             style="PanguFuser",
             dim=embed_dim * 2,
             input_resolution=patched_downsampled_shape,
-            depth=6,
+            depth=self.depth[2],
             num_heads=num_heads[2],
             window_size=window_size,
-            drop_path=drop_path[2:],
+            drop_path=drop_path[2 : 2 + self.depth[2]],
         )
         self.upsample = OneSample(
             style="PanguUpSample",
@@ -115,10 +122,10 @@ class PanguPatchSize(nn.Module):
             style="PanguFuser",
             dim=embed_dim,
             input_resolution=patched_input_shape,
-            depth=2,
+            depth=self.depth[3],
             num_heads=num_heads[3],
             window_size=window_size,
-            drop_path=drop_path[:2],
+            drop_path=drop_path[:self.depth[3]],
         )
 
         # ---- Patch Recovery（修复硬编码：从 patch_size 参数推导）----

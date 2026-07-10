@@ -129,10 +129,10 @@ def mb(path):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src", default=os.path.join("data", "checkpoints", "model_288_latest.pth"))
+    parser.add_argument("--src", default=os.path.join("data", "checkpoints", "model_288_pruned_bak.pth"))
     parser.add_argument(
         "--dst",
-        default=os.path.join("data", "checkpoints", "model_288_light_int8_bf16_mlpint8.pth"),
+        default=os.path.join("data", "checkpoints", "model_288_pruned_light_int8_bf16_mlpint8.pth"),
     )
     parser.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     return parser.parse_args()
@@ -165,4 +165,4 @@ if __name__ == "__main__":
     print(f"  compression: {src_mb / dst_mb:.2f}x")
     print(f"  saved: {(1.0 - dst_mb / src_mb) * 100:.1f}%")
     print("\nrun:")
-    print(f"  LIGHT_CKPT={args.dst} python xuinference.py")
+    print(f"  LIGHT_CKPT={args.dst} python inference.py")
