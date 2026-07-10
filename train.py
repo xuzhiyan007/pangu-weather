@@ -12,13 +12,44 @@ from pangu_patchsize import PanguPatchSize as Pangu
 from onescience.datapipes.climate import ERA5Datapipe
 from onescience.utils.YParams import YParams
 from onescience.memory.checkpoint import replace_function
-from apex import optimizers
 from torch.utils.data import Subset
 from torch.cuda.amp import autocast
+
+# 优先使用 apex FusedAdam（更快），不可用时回退到 torch.optim.AdamW
+try:
+    from apex import optimizers as _apex_optimizers
+    FusedAdam = _apex_optimizers.FusedAdam
+    print("✅ 使用 apex.FusedAdam 优化器")
+except ImportError:
+    FusedAdam = torch.optim.AdamW
+    print("⚠️  apex 未安装，回退到 torch.optim.AdamW")
 
 
 def loss_func(x, y, weights, level_weight=1.0):
     return level_weight * (F.l1_loss(x, y, reduction='none') * weights).mean()
+
+
+def should_skip_train_batch(batch_idx, epoch, skip_stride):
+    return skip_stride > 0 and batch_idx % skip_stride == (epoch % skip_stride)
+
+
+def count_kept_train_batches(num_batches, epoch, skip_stride, max_batches):
+    kept = 0
+    for batch_idx in range(num_batches):
+        if should_skip_train_batch(batch_idx, epoch, skip_stride):
+            continue
+        kept += 1
+        if kept >= max_batches:
+            break
+    return kept
+
+
+def build_scheduler(optimizer, epoch=0):
+    for group in optimizer.param_groups:
+        group.setdefault("initial_lr", group["lr"])
+    return torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=100, last_epoch=epoch - 1
+    )
 
 def main():
 
@@ -68,6 +99,7 @@ def main():
                   embed_dim=cfg.embed_dim,
                   num_heads=cfg.num_heads,
                   window_size=cfg.window_size,
+                  depth=cfg.depth,
                   ).to(local_rank)
     
     ## Train process init
@@ -92,7 +124,7 @@ def main():
     latest_ckpt_name = "model_288_latest.pth"
     best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
-    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "600"))
+    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "60"))
 
     ## Load model weight if there exist well-trained model
     start_epoch = 0
@@ -196,8 +228,8 @@ def main():
 
     ## Optimizer init（仅优化可训练参数，冻结的参数不进入 optimizer）
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optimizers.FusedAdam(trainable_params, betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+    optimizer = FusedAdam(trainable_params, betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6)
+    scheduler = build_scheduler(optimizer)
 
     ## 断点续训时恢复 optimizer/scheduler 状态
     if resume_ckpt_data is not None:
@@ -240,13 +272,14 @@ def main():
             val_sampler.set_epoch(epoch)
 
         # 解冻逻辑：到达指定 epoch 时解除 Transformer 冻结，全量微调
-        if freeze_transformer and epoch == unfreeze_epoch:
+        if freeze_transformer and epoch >= unfreeze_epoch:
             for param in raw_model.parameters():
                 param.requires_grad = True
-            optimizer = optimizers.FusedAdam(
+            optimizer = FusedAdam(
                 [p for p in model.parameters() if p.requires_grad],
                 betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6
             )
+            scheduler = build_scheduler(optimizer, epoch=epoch)
             freeze_transformer = False
             if world_rank == 0:
                 logger.info(f"🔓 epoch {epoch}: Transformer 已解冻，全量参数训练")
@@ -272,9 +305,10 @@ def main():
             train_skip_stride = 0
             train_max_batches = full_train_total
 
-        # 续训 epoch 处理剩余 batch，不做 stride 跳过
-        if epoch == start_epoch and resume_dataloader is not None:
-            train_skip_stride = 0
+        already_processed = count_kept_train_batches(
+            current_offset, epoch, train_skip_stride, train_max_batches
+        )
+        remaining_train_batches = max(0, train_max_batches - already_processed)
         accumulation_steps = int(os.environ.get("ACCUMULATION_STEPS", "2"))
         effective_batch_size = cfg_data.dataloader.batch_size * accumulation_steps
         if world_rank == 0:
@@ -285,12 +319,13 @@ def main():
             logger.info(f"skipping first {start_batch} batches to resume...")
         optimizer.zero_grad()
         for j, data in enumerate(current_dataloader):
-            if processed_batches >= train_max_batches:
+            if processed_batches >= remaining_train_batches:
                 break
+            global_batch_idx = current_offset + j
             if epoch == start_epoch and j < start_batch:
                 logger.info(f"  skip progress: {j}/{start_batch} batches")
                 continue
-            if train_skip_stride > 0 and j % train_skip_stride == (epoch % train_skip_stride):
+            if should_skip_train_batch(global_batch_idx, epoch, train_skip_stride):
                 continue
             invar = data[0]
             outvar = data[1]
@@ -315,7 +350,7 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
             if world_rank == 0:
-                logger.info(f'Train: Epoch {epoch}-{current_offset + processed_batches}/{train_max_batches} '
+                logger.info(f'Train: Epoch {epoch}-{already_processed + processed_batches}/{train_max_batches} '
                             f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
                             f'[{(time.time()-start_time)/processed_batches: .02f}s/{effective_batch_size}batch] '
                             f'loss:{train_loss / processed_batches: .04f}')
@@ -336,7 +371,9 @@ def main():
 
         model.eval()
         valid_loss = 0
-        val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", os.environ.get("VAL_MAX_BATCHES", "50")))
+        val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", "50"))
+        if "VAL_MAX_BATCHES" in os.environ and "VAL_MAX_SAMPLES" not in os.environ:
+            val_max_samples = int(os.environ["VAL_MAX_BATCHES"]) * cfg_data.dataloader.batch_size
         val_dataset = val_dataloader.dataset
         val_total_samples = len(val_dataset)
         if val_max_samples > 0 and val_max_samples < val_total_samples:
@@ -451,5 +488,3 @@ if __name__ == "__main__":
     current_path = os.getcwd()
     sys.path.append(current_path)
     main()
-
-
