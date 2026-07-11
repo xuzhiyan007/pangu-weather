@@ -14,6 +14,14 @@ from onescience.utils.YParams import YParams
 from onescience.memory.checkpoint import replace_function
 from torch.utils.data import Subset
 from torch.cuda.amp import autocast
+from distill_utils import (
+    init_patch_embed_from_official,
+    load_teacher_model,
+    compute_kd_loss,
+    setup_staged_freezing,
+    get_kd_alpha,
+    reset_interface_from_official,
+)
 
 # 优先使用 apex FusedAdam（更快），不可用时回退到 torch.optim.AdamW
 try:
@@ -204,6 +212,21 @@ def main():
     backbone_lr = float(os.environ.get("BACKBONE_LR", "5e-5"))
     interface_lr = float(os.environ.get("INTERFACE_LR", "2e-4"))
 
+    # ---- 蒸馏 & 分阶段冻结配置 ----
+    kd_enabled = os.environ.get("KD_ENABLED", "0") != "0"
+    kd_alpha_start = float(os.environ.get("KD_ALPHA", "1.0"))
+    kd_alpha_end = float(os.environ.get("KD_ALPHA_MIN", "0.3"))
+    unfreeze_epoch = int(os.environ.get("UNFREEZE_EPOCH", "2"))
+    surface_level_weight = float(os.environ.get("SURFACE_LEVEL_WEIGHT", "1.0"))
+    patch_embed_init = os.environ.get("PATCH_EMBED_INIT", "1") != "0"
+    reset_interface = os.environ.get("RESET_INTERFACE", "0") != "0"
+    teacher_model = None
+
+    # RESET_INTERFACE 联动：自动冻结 Transformer + 重置 optimizer
+    if reset_interface:
+        unfreeze_epoch = max(unfreeze_epoch, 999)
+        reset_optimizer = True
+
     # ---- Step 1: 断点续训（优先）：288 checkpoint = 继承全量模型训练后的结果 ----
     if os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path):
         resume_ckpt = latest_ckpt_path if os.path.exists(latest_ckpt_path) else best_ckpt_path
@@ -238,6 +261,18 @@ def main():
         if not reset_optimizer and os.path.exists(valid_loss_file):
             valid_losses = np.load(valid_loss_file)
         loaded_resume = True
+
+        # ---- 可选：从官方模型重置接口层（不删除 288 checkpoint）----
+        if reset_interface:
+            official_path = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
+            if os.path.exists(official_path):
+                if world_rank == 0:
+                    print("\n" + "-" * 50)
+                    print("🔄 重置接口层：从官方模型重置 downsample/upsample/patch_embed/recovery")
+                reset_interface_from_official(model, official_path, device='cpu', log_fn=print)
+                if world_rank == 0:
+                    print("-" * 50 + "\n")
+
         if world_rank == 0:
             print(f"loaded checkpoint weights, resume training from epoch {start_epoch}, batch {start_batch}")
             if reset_optimizer:
@@ -283,6 +318,18 @@ def main():
         start_epoch = 0
         start_batch = 0
 
+        # ---- patch_embed 智能初始化：4×4 → 8×8 聚合 ----
+        if patch_embed_init:
+            official_path = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
+            if os.path.exists(official_path):
+                if world_rank == 0:
+                    print("\n" + "-" * 50)
+                    print("🔧 patch_embed 智能初始化 (4×4 → 8×8 聚合)")
+                n = init_patch_embed_from_official(model, official_path, device='cpu', log_fn=print)
+                if world_rank == 0:
+                    print(f"   初始化 {n} 个 conv 权重")
+                    print("-" * 50 + "\n")
+
     if world_rank == 0:
         total = sum(p.numel() for p in model.parameters())
         print(f"full fine-tune enabled: {total} parameters trainable")
@@ -295,6 +342,30 @@ def main():
     ## Optimizer init: low-lr full fine-tuning with separate backbone/interface groups.
     optimizer = build_optimizer(model, backbone_lr=backbone_lr, interface_lr=interface_lr)
     scheduler = build_scheduler(optimizer)
+
+    # ---- 加载 Teacher 模型（蒸馏模式）----
+    if kd_enabled:
+        teacher_ckpt = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
+        teacher_depth = tuple(int(x) for x in os.environ.get("TEACHER_DEPTH", "2,6,6,2").split(","))
+        if os.path.exists(teacher_ckpt):
+            teacher_model = load_teacher_model(
+                teacher_ckpt,
+                img_size=cfg_data.dataset.img_size,
+                device=local_rank,
+                depth=teacher_depth,
+                patch_size=(2, 4, 4),
+                embed_dim=cfg.embed_dim,
+                num_heads=cfg.num_heads,
+                window_size=cfg.window_size,
+                log_fn=print if world_rank == 0 else lambda *a: None,
+            )
+            if world_rank == 0:
+                print(f"🎓 蒸馏模式: teacher=[2,4,4] depth={teacher_depth}, "
+                      f"KD alpha {kd_alpha_start}→{kd_alpha_end}, unfreeze@epoch {unfreeze_epoch}")
+        else:
+            if world_rank == 0:
+                print(f"⚠️  KD_ENABLED=1 但未找到 teacher checkpoint: {teacher_ckpt}")
+            kd_enabled = False
 
     ## Only restore optimizer/scheduler when explicitly requested.
     if resume_ckpt_data is not None and not reset_optimizer:
@@ -340,7 +411,15 @@ def main():
 
         model.train()
         train_loss = 0
+        train_kd_loss = 0
         processed_batches = 0
+
+        # ---- 分阶段解冻 ----
+        setup_staged_freezing(
+            raw_model, epoch, unfreeze_epoch=unfreeze_epoch,
+            log_fn=logger.info if world_rank == 0 else lambda *a: None,
+        )
+        kd_alpha = get_kd_alpha(epoch, cfg.max_epoch, kd_alpha_start, kd_alpha_end)
 
         # 续训 epoch 用截断 DataLoader，后续 epoch 恢复全量 DataLoader
         if epoch == start_epoch and resume_dataloader is not None:
@@ -393,12 +472,29 @@ def main():
                 with autocast(dtype=torch.bfloat16):
                     out_surface, out_upper_air = model(invar)
                     out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
-                    loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25)
+                    loss1 = loss_func(out_surface, tar_surface, surface_weights, level_weight=surface_level_weight)
                     loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0)
-            # 总 loss（按累积步数缩放，使梯度等价于大 batch）
-            loss = (loss1 + loss2) / accumulation_steps
+
+                    if kd_enabled and teacher_model is not None:
+                        with torch.no_grad():
+                            teacher_s, teacher_u = teacher_model(invar)
+                            teacher_u = teacher_u.reshape(tar_upper_air.shape)
+                        kd_loss = compute_kd_loss(
+                            out_surface, out_upper_air,
+                            teacher_s, teacher_u,
+                            surface_weights, pressure_weights,
+                            level_weight_surface=surface_level_weight,
+                            level_weight_upper=1.0,
+                        )
+                    else:
+                        kd_loss = torch.tensor(0.0, device=local_rank)
+            # 总 loss = GT loss + α × KD loss（按累积步数缩放）
+            total_gt_loss = loss1 + loss2
+            total_loss = total_gt_loss + kd_alpha * kd_loss
+            loss = total_loss / accumulation_steps
             loss.backward()
-            train_loss += (loss.item() * accumulation_steps)  # 记录原始 loss 用于日志
+            train_loss += total_loss.item()
+            train_kd_loss += kd_loss.item()
             processed_batches += 1
             if processed_batches % accumulation_steps == 0:
                 optimizer.step()
@@ -407,7 +503,8 @@ def main():
                 logger.info(f'Train: Epoch {epoch}-{already_processed + processed_batches}/{train_max_batches} '
                             f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
                             f'[{(time.time()-start_time)/processed_batches: .02f}s/{effective_batch_size}batch] '
-                            f'loss:{train_loss / processed_batches: .04f}')
+                            f'loss:{train_loss / processed_batches: .04f}'
+                            + (f' kd:{train_kd_loss / processed_batches: .04f}(α={kd_alpha:.2f})' if kd_enabled else ''))
                 if save_interval_sec > 0 and time.time() - last_interval_save >= save_interval_sec:
                     save_checkpoint(
                         model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
@@ -459,7 +556,7 @@ def main():
                 with autocast(dtype=torch.bfloat16):
                     out_surface, out_upper_air = model(invar)
                     out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
-                    loss1 = loss_func(out_surface, tar_surface, surface_weights,  level_weight=0.25).item()
+                    loss1 = loss_func(out_surface, tar_surface, surface_weights, level_weight=surface_level_weight).item()
                     loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0).item()
                 # 总 loss
                 loss = loss1 + loss2
