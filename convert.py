@@ -40,11 +40,19 @@ def compact_float_tensor(tensor, dtype):
     return t.contiguous() if not t.is_contiguous() else t.clone()
 
 
-def is_duplicate_fuser_bias(key, state_dict):
-    if POSITION_BIAS_NAME not in key or ".Fuser." not in key:
+def duplicate_fuser_pair_key(key):
+    if ".Fuser." not in key:
+        return None
+    return key.replace(".Fuser.", ".fuser.")
+
+
+def is_duplicate_fuser_tensor(key, state_dict):
+    pair_key = duplicate_fuser_pair_key(key)
+    if pair_key is None or pair_key not in state_dict:
         return False
-    pair_key = key.replace(".Fuser.", ".fuser.")
-    return pair_key in state_dict and torch.equal(state_dict[key], state_dict[pair_key])
+    value = state_dict[key]
+    pair_value = state_dict[pair_key]
+    return torch.is_tensor(pair_value) and torch.equal(value, pair_value)
 
 
 def is_mlp_weight(key):
@@ -64,7 +72,7 @@ def convert_checkpoint(src_path, dst_path, dtype):
     stats = {
         "normal_tensors": 0,
         "position_bias_quantized": 0,
-        "position_bias_duplicate_skipped": 0,
+        "duplicate_fuser_tensors_skipped": 0,
         "mlp_weight_quantized": 0,
         "attn_mask_skipped": 0,
         "non_tensor": 0,
@@ -80,10 +88,11 @@ def convert_checkpoint(src_path, dst_path, dtype):
             stats["attn_mask_skipped"] += 1
             continue
 
+        if is_duplicate_fuser_tensor(key, src_state):
+            stats["duplicate_fuser_tensors_skipped"] += 1
+            continue
+
         if POSITION_BIAS_NAME in key:
-            if is_duplicate_fuser_bias(key, src_state):
-                stats["position_bias_duplicate_skipped"] += 1
-                continue
             q, scale = quantize_symmetric_int8_per_tensor(value)
             position_bias_int8[key] = q
             position_bias_scale[key] = scale
@@ -113,7 +122,7 @@ def convert_checkpoint(src_path, dst_path, dtype):
             "mlp_weight": "symmetric_int8_per_output_channel_scale",
             "mlp_bias": "kept_in_normal_weight_dtype",
             "dropped_attn_mask": "recreated by Pangu model init",
-            "dropped_duplicate_position_bias": "Fuser duplicates fuser when equal",
+            "dropped_duplicate_fuser_tensors": "Fuser duplicates fuser when tensor values are equal",
         },
     }
     dst_dir = os.path.dirname(dst_path)
@@ -129,10 +138,10 @@ def mb(path):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src", default=os.path.join("data", "checkpoints", "model_288_pruned_bak.pth"))
+    parser.add_argument("--src", default=os.path.join("data", "checkpoints", "model_288_latest.pth"))
     parser.add_argument(
         "--dst",
-        default=os.path.join("data", "checkpoints", "model_288_pruned_light_int8_bf16_mlpint8.pth"),
+        default=os.path.join("data", "checkpoints", "model_288_light_int8_bf16_mlpint8.pth"),
     )
     parser.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     return parser.parse_args()
@@ -151,6 +160,7 @@ if __name__ == "__main__":
     print(f"{POSITION_BIAS_NAME}: int8 + fp16 scale")
     print("MLP fc1/fc2 weight: int8 + fp16 per-output-channel scale")
     print("MLP bias and other tensors: normal tensor dtype")
+    print("duplicate .Fuser. tensors: dropped when identical to .fuser.")
 
     stats = convert_checkpoint(args.src, args.dst, dtype)
 
