@@ -5,7 +5,6 @@ import numpy as np
 import torch.distributed as dist
 import logging
 import time
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 # from onescience.models.pangu import Pangu
 from pangu_patchsize import PanguPatchSize as Pangu
@@ -15,12 +14,11 @@ from onescience.memory.checkpoint import replace_function
 from torch.utils.data import Subset
 from torch.cuda.amp import autocast
 from distill_utils import (
+    get_kd_alpha,
     init_patch_embed_from_official,
     load_teacher_model,
-    compute_kd_loss,
-    setup_staged_freezing,
-    get_kd_alpha,
     reset_interface_from_official,
+    setup_staged_freezing,
 )
 
 # 优先使用 apex FusedAdam（更快），不可用时回退到 torch.optim.AdamW
@@ -50,30 +48,88 @@ TARGET_LOSS_CHANNELS = {
     "u_component_of_wind_500",
     "v_component_of_wind_500",
 }
+LOSS_VERSION = "score_aligned_mse_acc_v1"
 
-def build_score_focused_weights(
-    channels,
-    base_weights,
-    target_weight=1.0,
-    aux_scale=0.5,
-    aux_min=0.03,
-    aux_max=0.15,
+
+def build_target_channel_indices(channels):
+    channel_to_index = {name: index for index, name in enumerate(channels)}
+    missing = sorted(TARGET_LOSS_CHANNELS.difference(channel_to_index))
+    if missing:
+        raise ValueError(f"Scored channels are missing from the dataset: {missing}")
+    return [
+        index for index, name in enumerate(channels)
+        if name in TARGET_LOSS_CHANNELS
+    ]
+
+
+def build_latitude_weights(height, device):
+    latitudes = torch.linspace(90.0, -90.0, height, device=device, dtype=torch.float32)
+    weights = torch.cos(torch.deg2rad(latitudes)).clamp_min(0.0)
+    return weights.view(1, 1, height, 1)
+
+
+def score_aligned_loss(
+    prediction,
+    target,
+    target_indices,
+    latitude_weights,
+    mse_weight=0.8,
+    acc_weight=0.2,
+    auxiliary_weight=0.05,
+    eps=1e-6,
 ):
-    weights = []
-    counts = {"target": 0, "auxiliary": 0}
-    for channel, base_weight in zip(channels, base_weights):
-        if channel in TARGET_LOSS_CHANNELS:
-            weights.append(target_weight)
-            counts["target"] += 1
-        else:
-            weights.append(min(aux_max, max(aux_min, float(base_weight) * aux_scale)))
-            counts["auxiliary"] += 1
-    return weights, counts
+    """Equal-channel loss for the 15 scored fields plus a weak auxiliary loss."""
+    scored_prediction = prediction.index_select(1, target_indices).float()
+    scored_target = target.index_select(1, target_indices).float()
+
+    spatial_weight_sum = latitude_weights.sum() * prediction.shape[-1]
+    squared_error = (scored_prediction - scored_target).square()
+    per_field_mse = (squared_error * latitude_weights).sum(dim=(-2, -1)) / spatial_weight_sum
+    scored_mse = per_field_mse.mean()
+
+    pred_mean = (scored_prediction * latitude_weights).sum(dim=(-2, -1), keepdim=True) / spatial_weight_sum
+    target_mean = (scored_target * latitude_weights).sum(dim=(-2, -1), keepdim=True) / spatial_weight_sum
+    pred_anomaly = scored_prediction - pred_mean
+    target_anomaly = scored_target - target_mean
+    covariance = (pred_anomaly * target_anomaly * latitude_weights).sum(dim=(-2, -1))
+    pred_variance = (pred_anomaly.square() * latitude_weights).sum(dim=(-2, -1))
+    target_variance = (target_anomaly.square() * latitude_weights).sum(dim=(-2, -1))
+    correlation = covariance / torch.sqrt(pred_variance * target_variance + eps)
+    correlation = correlation.clamp(-1.0, 1.0)
+    acc_loss = (1.0 - correlation).mean()
+
+    auxiliary_mask = torch.ones(prediction.shape[1], device=prediction.device, dtype=torch.bool)
+    auxiliary_mask[target_indices] = False
+    if auxiliary_weight > 0.0 and auxiliary_mask.any():
+        auxiliary_error = (prediction[:, auxiliary_mask].float() - target[:, auxiliary_mask].float()).square()
+        per_aux_field_mse = (auxiliary_error * latitude_weights).sum(dim=(-2, -1)) / spatial_weight_sum
+        auxiliary_loss = per_aux_field_mse.mean()
+    else:
+        auxiliary_loss = prediction.new_zeros((), dtype=torch.float32)
+
+    total = mse_weight * scored_mse + acc_weight * acc_loss + auxiliary_weight * auxiliary_loss
+    components = {
+        "mse": scored_mse.detach(),
+        "acc": correlation.mean().detach(),
+        "aux": auxiliary_loss.detach(),
+    }
+    return total, components
 
 
-def loss_func(x, y, weights, level_weight=1.0):
-    return level_weight * (F.l1_loss(x, y, reduction='none') * weights).mean()
-
+def score_aligned_kd_loss(
+    student_prediction,
+    teacher_prediction,
+    target_indices,
+    latitude_weights,
+):
+    """Distill only the 15 scored fields, with the same per-field reduction as GT MSE."""
+    student_scored = student_prediction.index_select(1, target_indices).float()
+    teacher_scored = teacher_prediction.index_select(1, target_indices).detach().float()
+    spatial_weight_sum = latitude_weights.sum() * student_prediction.shape[-1]
+    per_field_mse = (
+        (student_scored - teacher_scored).square() * latitude_weights
+    ).sum(dim=(-2, -1)) / spatial_weight_sum
+    return per_field_mse.mean()
 
 def should_skip_train_batch(batch_idx, epoch, skip_stride):
     return skip_stride > 0 and batch_idx % skip_stride == (epoch % skip_stride)
@@ -149,18 +205,17 @@ def main():
     train_dataloader, train_sampler = datapipe.train_dataloader()
     val_dataloader, val_sampler = datapipe.val_dataloader()
 
-    score_weights, score_weight_counts = build_score_focused_weights(
-        cfg_data.dataset.channels,
-        cfg_data.dataset.weights,
-    )
-    surface_weights = torch.as_tensor(score_weights[:4], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
-    pressure_weights = torch.as_tensor(score_weights[4:], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
+    target_channel_indices = build_target_channel_indices(cfg_data.dataset.channels)
+    target_indices = torch.as_tensor(target_channel_indices, device=local_rank, dtype=torch.long)
+    latitude_weights = build_latitude_weights(cfg_data.dataset.img_size[0], local_rank)
+    score_mse_weight = float(os.environ.get("SCORE_MSE_WEIGHT", "0.8"))
+    score_acc_weight = float(os.environ.get("SCORE_ACC_WEIGHT", "0.2"))
+    auxiliary_loss_weight = float(os.environ.get("AUXILIARY_LOSS_WEIGHT", "0.05"))
     if world_rank == 0:
         print(
-            "score-focused loss weights: "
-            f"target={score_weight_counts['target']}x1.0, "
-            f"auxiliary={score_weight_counts['auxiliary']} scaled from config weights "
-            "(clamp 0.03..0.15, scale=0.5)"
+            "score-aligned loss: "
+            f"15 scored fields equally weighted, latitude-weighted MSE={score_mse_weight}, "
+            f"spatial ACC proxy={score_acc_weight}, auxiliary MSE={auxiliary_loss_weight}"
         )
 
     land_mask = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "land_mask.npy")).astype(np.float32))
@@ -181,8 +236,12 @@ def main():
     
     ## Train process init
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    train_loss_file = f"{cfg.checkpoint_dir}/trloss_288.npy"
-    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_288.npy"
+    run_tag = os.environ.get("RUN_TAG", "").strip()
+    if run_tag and not all(char.isalnum() or char in "-_" for char in run_tag):
+        raise ValueError("RUN_TAG may contain only letters, digits, '-' and '_'")
+    artifact_suffix = f"_{run_tag}" if run_tag else ""
+    train_loss_file = f"{cfg.checkpoint_dir}/trloss_288{artifact_suffix}.npy"
+    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_288{artifact_suffix}.npy"
     best_valid_loss = 1.0e6
     best_loss_epoch = 0
     train_losses = np.empty((0,), dtype=np.float32)
@@ -197,8 +256,8 @@ def main():
         print("-" * 50, "\n")
 
     ## Checkpoint file names
-    best_ckpt_name = "model_288_bak.pth"
-    latest_ckpt_name = "model_288_latest.pth"
+    best_ckpt_name = f"model_288{artifact_suffix}_bak.pth"
+    latest_ckpt_name = f"model_288{artifact_suffix}_latest.pth"
     best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
     save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "600"))
@@ -208,24 +267,26 @@ def main():
     start_batch = 0
     loaded_resume = False
     resume_ckpt_data = None
+    loss_definition_changed = False
     reset_optimizer = os.environ.get("RESET_OPTIMIZER", "0") != "0"
+    override_resume_lr = os.environ.get("OVERRIDE_RESUME_LR", "0") != "0"
     backbone_lr = float(os.environ.get("BACKBONE_LR", "5e-5"))
     interface_lr = float(os.environ.get("INTERFACE_LR", "2e-4"))
-
-    # ---- 蒸馏 & 分阶段冻结配置 ----
     kd_enabled = os.environ.get("KD_ENABLED", "0") != "0"
-    kd_alpha_start = float(os.environ.get("KD_ALPHA", "1.0"))
-    kd_alpha_end = float(os.environ.get("KD_ALPHA_MIN", "0.3"))
-    unfreeze_epoch = int(os.environ.get("UNFREEZE_EPOCH", "2"))
-    surface_level_weight = float(os.environ.get("SURFACE_LEVEL_WEIGHT", "1.0"))
+    kd_interface_only = os.environ.get("KD_INTERFACE_ONLY", "1") != "0"
+    kd_alpha_start = float(os.environ.get("KD_ALPHA", "0.2"))
+    kd_alpha_end = float(os.environ.get("KD_ALPHA_MIN", "0.02"))
     patch_embed_init = os.environ.get("PATCH_EMBED_INIT", "1") != "0"
     reset_interface = os.environ.get("RESET_INTERFACE", "0") != "0"
+    freeze_backbone_epochs = int(os.environ.get("FREEZE_BACKBONE_EPOCHS", "0"))
     teacher_model = None
 
-    # RESET_INTERFACE 联动：自动冻结 Transformer + 重置 optimizer
     if reset_interface:
-        unfreeze_epoch = max(unfreeze_epoch, 999)
         reset_optimizer = True
+    if kd_enabled and kd_interface_only and freeze_backbone_epochs <= 0:
+        raise ValueError(
+            "KD_INTERFACE_ONLY=1 requires FREEZE_BACKBONE_EPOCHS > 0"
+        )
 
     # ---- Step 1: 断点续训（优先）：288 checkpoint = 继承全量模型训练后的结果 ----
     if os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path):
@@ -239,6 +300,18 @@ def main():
         ckpt = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         resume_ckpt_data = ckpt
+        if world_rank == 0:
+            logger.info(f"loaded student weights from {resume_ckpt}")
+        checkpoint_loss_version = ckpt.get("loss_version")
+        if checkpoint_loss_version != LOSS_VERSION:
+            loss_definition_changed = True
+            reset_optimizer = True
+            if world_rank == 0:
+                print(
+                    "loss definition changed "
+                    f"({checkpoint_loss_version!r} -> {LOSS_VERSION!r}); "
+                    "optimizer, scheduler, best loss, and loss history will be reset"
+                )
         saved_epoch = int(ckpt.get("epoch", -1))
         if ckpt.get("epoch_complete", True):
             start_epoch = saved_epoch + 1
@@ -246,6 +319,14 @@ def main():
         else:
             start_epoch = saved_epoch
             start_batch = int(ckpt.get("next_batch_idx", 0))
+
+        if loss_definition_changed and start_batch != 0:
+            if world_rank == 0:
+                logger.info(
+                    f"new loss warm-up: resetting batch offset {start_batch} -> 0 "
+                    "while keeping loaded model weights and epoch"
+                )
+            start_batch = 0
 
         if reset_optimizer:
             best_valid_loss = 1.0e6
@@ -262,16 +343,22 @@ def main():
             valid_losses = np.load(valid_loss_file)
         loaded_resume = True
 
-        # ---- 可选：从官方模型重置接口层（不删除 288 checkpoint）----
         if reset_interface:
             official_path = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
-            if os.path.exists(official_path):
-                if world_rank == 0:
-                    print("\n" + "-" * 50)
-                    print("🔄 重置接口层：从官方模型重置 downsample/upsample/patch_embed/recovery")
-                reset_interface_from_official(model, official_path, device='cpu', log_fn=print)
-                if world_rank == 0:
-                    print("-" * 50 + "\n")
+            if not os.path.exists(official_path):
+                raise FileNotFoundError(
+                    f"RESET_INTERFACE=1 requires official checkpoint: {official_path}"
+                )
+            if world_rank == 0:
+                print("resetting interface from official [2,4,4] checkpoint")
+            reset_count = reset_interface_from_official(
+                model,
+                official_path,
+                device="cpu",
+                log_fn=print if world_rank == 0 else lambda *args: None,
+            )
+            if reset_count == 0:
+                raise RuntimeError("Interface reset did not copy or initialize any parameters")
 
         if world_rank == 0:
             print(f"loaded checkpoint weights, resume training from epoch {start_epoch}, batch {start_batch}")
@@ -318,17 +405,21 @@ def main():
         start_epoch = 0
         start_batch = 0
 
-        # ---- patch_embed 智能初始化：4×4 → 8×8 聚合 ----
         if patch_embed_init:
-            official_path = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
-            if os.path.exists(official_path):
-                if world_rank == 0:
-                    print("\n" + "-" * 50)
-                    print("🔧 patch_embed 智能初始化 (4×4 → 8×8 聚合)")
-                n = init_patch_embed_from_official(model, official_path, device='cpu', log_fn=print)
-                if world_rank == 0:
-                    print(f"   初始化 {n} 个 conv 权重")
-                    print("-" * 50 + "\n")
+            if world_rank == 0:
+                print("initializing mismatched patch projections: [2,4,4] -> [2,8,8]")
+            initialized_count = init_patch_embed_from_official(
+                model,
+                warm_start_path,
+                device="cpu",
+                log_fn=print if world_rank == 0 else lambda *args: None,
+            )
+            if world_rank == 0:
+                print(f"initialized {initialized_count} patch projection weights")
+            if initialized_count == 0:
+                raise RuntimeError(
+                    "PATCH_EMBED_INIT=1 did not find compatible 4x4 -> 8x8 projection weights"
+                )
 
     if world_rank == 0:
         total = sum(p.numel() for p in model.parameters())
@@ -343,36 +434,67 @@ def main():
     optimizer = build_optimizer(model, backbone_lr=backbone_lr, interface_lr=interface_lr)
     scheduler = build_scheduler(optimizer)
 
-    # ---- 加载 Teacher 模型（蒸馏模式）----
+    freeze_until_epoch = start_epoch + max(0, freeze_backbone_epochs)
     if kd_enabled:
         teacher_ckpt = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
-        teacher_depth = tuple(int(x) for x in os.environ.get("TEACHER_DEPTH", "2,6,6,2").split(","))
-        if os.path.exists(teacher_ckpt):
-            teacher_model = load_teacher_model(
-                teacher_ckpt,
-                img_size=cfg_data.dataset.img_size,
-                device=local_rank,
-                depth=teacher_depth,
-                patch_size=(2, 4, 4),
-                embed_dim=cfg.embed_dim,
-                num_heads=cfg.num_heads,
-                window_size=cfg.window_size,
-                log_fn=print if world_rank == 0 else lambda *a: None,
+        if not os.path.exists(teacher_ckpt):
+            raise FileNotFoundError(f"KD_ENABLED=1 requires official checkpoint: {teacher_ckpt}")
+        teacher_depth = tuple(
+            int(value) for value in os.environ.get("TEACHER_DEPTH", "2,6,6,2").split(",")
+        )
+        teacher_model = load_teacher_model(
+            teacher_ckpt,
+            img_size=cfg_data.dataset.img_size,
+            device=local_rank,
+            depth=teacher_depth,
+            patch_size=(2, 4, 4),
+            embed_dim=cfg.embed_dim,
+            num_heads=cfg.num_heads,
+            window_size=cfg.window_size,
+            dtype=torch.bfloat16,
+            log_fn=print if world_rank == 0 else lambda *args: None,
+        )
+        if world_rank == 0:
+            print(
+                f"distillation enabled: alpha {kd_alpha_start} -> {kd_alpha_end}, "
+                "teacher patch_size=[2,4,4], scored fields only, "
+                f"interface_only={kd_interface_only}"
             )
-            if world_rank == 0:
-                print(f"🎓 蒸馏模式: teacher=[2,4,4] depth={teacher_depth}, "
-                      f"KD alpha {kd_alpha_start}→{kd_alpha_end}, unfreeze@epoch {unfreeze_epoch}")
-        else:
-            if world_rank == 0:
-                print(f"⚠️  KD_ENABLED=1 但未找到 teacher checkpoint: {teacher_ckpt}")
-            kd_enabled = False
+
+    if world_rank == 0 and freeze_backbone_epochs > 0:
+        print(
+            f"backbone warm-up freeze: epochs [{start_epoch}, {freeze_until_epoch}) "
+            f"({freeze_backbone_epochs} epoch(s))"
+        )
 
     ## Only restore optimizer/scheduler when explicitly requested.
     if resume_ckpt_data is not None and not reset_optimizer:
         optimizer.load_state_dict(resume_ckpt_data["optimizer_state_dict"])
         scheduler.load_state_dict(resume_ckpt_data["scheduler_state_dict"])
+        if override_resume_lr:
+            requested_lrs = (backbone_lr, interface_lr)
+            if len(optimizer.param_groups) != len(requested_lrs):
+                raise RuntimeError(
+                    "Cannot override resumed learning rates: expected two optimizer groups, "
+                    f"found {len(optimizer.param_groups)}"
+                )
+            for group, requested_lr in zip(optimizer.param_groups, requested_lrs):
+                group["lr"] = requested_lr
+                group["initial_lr"] = requested_lr
+            scheduler.base_lrs = list(requested_lrs)
         if world_rank == 0:
             print("✅ optimizer/scheduler 状态已恢复")
+            if override_resume_lr:
+                print(
+                    "resumed learning rates overridden: "
+                    f"backbone={backbone_lr}, interface={interface_lr}"
+                )
+            else:
+                print(
+                    "resumed learning rates kept from checkpoint: "
+                    f"backbone={optimizer.param_groups[0]['lr']}, "
+                    f"interface={optimizer.param_groups[1]['lr']}"
+                )
     elif resume_ckpt_data is not None and world_rank == 0:
         print("optimizer/scheduler initialized fresh for new loss/lr")
 
@@ -411,15 +533,30 @@ def main():
 
         model.train()
         train_loss = 0
+        train_gt_loss = 0
         train_kd_loss = 0
         processed_batches = 0
 
-        # ---- 分阶段解冻 ----
         setup_staged_freezing(
-            raw_model, epoch, unfreeze_epoch=unfreeze_epoch,
-            log_fn=logger.info if world_rank == 0 else lambda *a: None,
+            raw_model,
+            epoch,
+            unfreeze_epoch=freeze_until_epoch,
+            log_fn=logger.info if world_rank == 0 else lambda *args: None,
         )
-        kd_alpha = get_kd_alpha(epoch, cfg.max_epoch, kd_alpha_start, kd_alpha_end)
+        kd_alpha = get_kd_alpha(
+            epoch - start_epoch,
+            max(1, cfg.max_epoch - start_epoch),
+            kd_alpha_start,
+            kd_alpha_end,
+        )
+        kd_active = kd_enabled and (
+            not kd_interface_only or epoch < freeze_until_epoch
+        )
+        if kd_enabled and kd_interface_only and not kd_active and teacher_model is not None:
+            teacher_model = None
+            torch.cuda.empty_cache()
+            if world_rank == 0:
+                logger.info("interface warm-up complete: Teacher released and KD disabled")
 
         # 续训 epoch 用截断 DataLoader，后续 epoch 恢复全量 DataLoader
         if epoch == start_epoch and resume_dataloader is not None:
@@ -431,6 +568,10 @@ def main():
 
         # train_max_batches / train_skip_stride 始终基于全量 DataLoader 计算
         train_max_batches = int(os.environ.get("TRAIN_MAX_BATCHES", "2940"))
+        if epoch < freeze_until_epoch:
+            train_max_batches = int(
+                os.environ.get("WARMUP_MAX_BATCHES", str(train_max_batches))
+            )
         full_train_total = len(original_train_dataloader)
         if train_max_batches > 0 and train_max_batches < full_train_total:
             train_skip_stride = max(2, round(full_train_total / (full_train_total - train_max_batches)))
@@ -442,6 +583,13 @@ def main():
             current_offset, epoch, train_skip_stride, train_max_batches
         )
         remaining_train_batches = max(0, train_max_batches - already_processed)
+        if remaining_train_batches <= 0:
+            raise RuntimeError(
+                "No training batches remain for this epoch: "
+                f"full_train_total={full_train_total}, current_offset={current_offset}, "
+                f"already_processed={already_processed}, train_max_batches={train_max_batches}. "
+                "Check the checkpoint batch offset and dataset configuration."
+            )
         accumulation_steps = int(os.environ.get("ACCUMULATION_STEPS", "2"))
         effective_batch_size = cfg_data.dataloader.batch_size * accumulation_steps
         if world_rank == 0:
@@ -472,28 +620,40 @@ def main():
                 with autocast(dtype=torch.bfloat16):
                     out_surface, out_upper_air = model(invar)
                     out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
-                    loss1 = loss_func(out_surface, tar_surface, surface_weights, level_weight=surface_level_weight)
-                    loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0)
+                prediction = torch.concat([out_surface, out_upper_air], dim=1)
+                target = torch.concat([tar_surface, tar_upper_air], dim=1)
+                raw_loss, loss_components = score_aligned_loss(
+                    prediction,
+                    target,
+                    target_indices,
+                    latitude_weights,
+                    mse_weight=score_mse_weight,
+                    acc_weight=score_acc_weight,
+                    auxiliary_weight=auxiliary_loss_weight,
+                )
+            # 总 loss（按累积步数缩放，使梯度等价于大 batch）
+            if kd_active and teacher_model is not None:
+                with torch.no_grad():
+                    with autocast(dtype=torch.bfloat16):
+                        teacher_surface, teacher_upper_air = teacher_model(invar)
+                        teacher_upper_air = teacher_upper_air.reshape(tar_upper_air.shape)
+                teacher_prediction = torch.concat(
+                    [teacher_surface, teacher_upper_air], dim=1
+                )
+                kd_loss = score_aligned_kd_loss(
+                    prediction,
+                    teacher_prediction,
+                    target_indices,
+                    latitude_weights,
+                )
+            else:
+                kd_loss = raw_loss.new_zeros(())
 
-                    if kd_enabled and teacher_model is not None:
-                        with torch.no_grad():
-                            teacher_s, teacher_u = teacher_model(invar)
-                            teacher_u = teacher_u.reshape(tar_upper_air.shape)
-                        kd_loss = compute_kd_loss(
-                            out_surface, out_upper_air,
-                            teacher_s, teacher_u,
-                            surface_weights, pressure_weights,
-                            level_weight_surface=surface_level_weight,
-                            level_weight_upper=1.0,
-                        )
-                    else:
-                        kd_loss = torch.tensor(0.0, device=local_rank)
-            # 总 loss = GT loss + α × KD loss（按累积步数缩放）
-            total_gt_loss = loss1 + loss2
-            total_loss = total_gt_loss + kd_alpha * kd_loss
+            total_loss = raw_loss + kd_alpha * kd_loss
             loss = total_loss / accumulation_steps
             loss.backward()
             train_loss += total_loss.item()
+            train_gt_loss += raw_loss.item()
             train_kd_loss += kd_loss.item()
             processed_batches += 1
             if processed_batches % accumulation_steps == 0:
@@ -503,8 +663,15 @@ def main():
                 logger.info(f'Train: Epoch {epoch}-{already_processed + processed_batches}/{train_max_batches} '
                             f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
                             f'[{(time.time()-start_time)/processed_batches: .02f}s/{effective_batch_size}batch] '
-                            f'loss:{train_loss / processed_batches: .04f}'
-                            + (f' kd:{train_kd_loss / processed_batches: .04f}(α={kd_alpha:.2f})' if kd_enabled else ''))
+                            f'loss:{train_loss / processed_batches: .04f} '
+                            f'gt:{train_gt_loss / processed_batches:.04f} '
+                            f'mse:{loss_components["mse"].item():.04f} '
+                            f'acc:{loss_components["acc"].item():.04f} '
+                            f'aux:{loss_components["aux"].item():.04f}'
+                            + (
+                                f' kd:{train_kd_loss / processed_batches:.04f}(alpha={kd_alpha:.03f})'
+                                if kd_active else ''
+                            ))
                 if save_interval_sec > 0 and time.time() - last_interval_save >= save_interval_sec:
                     save_checkpoint(
                         model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
@@ -522,6 +689,9 @@ def main():
 
         model.eval()
         valid_loss = 0
+        valid_mse = 0
+        valid_acc = 0
+        valid_aux = 0
         val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", "500"))
         if "VAL_MAX_BATCHES" in os.environ and "VAL_MAX_SAMPLES" not in os.environ:
             val_max_samples = int(os.environ["VAL_MAX_BATCHES"]) * cfg_data.dataloader.batch_size
@@ -556,16 +726,28 @@ def main():
                 with autocast(dtype=torch.bfloat16):
                     out_surface, out_upper_air = model(invar)
                     out_upper_air = out_upper_air.reshape(tar_upper_air.shape)
-                    loss1 = loss_func(out_surface, tar_surface, surface_weights, level_weight=surface_level_weight).item()
-                    loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0).item()
+                prediction = torch.concat([out_surface, out_upper_air], dim=1)
+                target = torch.concat([tar_surface, tar_upper_air], dim=1)
+                loss_tensor, loss_components = score_aligned_loss(
+                    prediction,
+                    target,
+                    target_indices,
+                    latitude_weights,
+                    mse_weight=score_mse_weight,
+                    acc_weight=score_acc_weight,
+                    auxiliary_weight=auxiliary_loss_weight,
+                )
                 # 总 loss
-                loss = loss1 + loss2
+                loss = loss_tensor.item()
 
                 if cfg.world_size > 1:
                     loss_tensor = torch.tensor(loss, device=local_rank)
                     dist.all_reduce(loss_tensor)
                     loss = loss_tensor.item() / cfg.world_size
                 valid_loss += loss
+                valid_mse += loss_components["mse"].item()
+                valid_acc += loss_components["acc"].item()
+                valid_aux += loss_components["aux"].item()
                 val_processed += 1
                 if world_rank == 0:
                     seen_samples = min(val_processed * cfg_data.dataloader.batch_size, val_max_samples)
@@ -573,7 +755,10 @@ def main():
                             f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
                             f'[{(time.time()-start_time)/val_processed: .02f}s/{cfg_data.dataloader.batch_size}batch] '
                             f'samples:{seen_samples}/{val_max_samples} '
-                            f'loss:{valid_loss / val_processed: .04f}')
+                            f'loss:{valid_loss / val_processed: .04f} '
+                            f'mse:{valid_mse / val_processed:.04f} '
+                            f'acc:{valid_acc / val_processed:.04f} '
+                            f'aux:{valid_aux / val_processed:.04f}')
                 
         valid_loss /= max(1, val_processed)
         is_save_ckp = False
@@ -626,6 +811,7 @@ def save_checkpoint(model, optimizer, scheduler, best_valid_loss, best_loss_epoc
         "epoch": epoch,
         "next_batch_idx": next_batch_idx,
         "epoch_complete": epoch_complete,
+        "loss_version": LOSS_VERSION,
     }
     os.makedirs(model_path, exist_ok=True)
     tmp_path = os.path.join(model_path, filename + ".tmp")
