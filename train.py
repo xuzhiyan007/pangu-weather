@@ -25,6 +25,44 @@ except ImportError:
     print("⚠️  apex 未安装，回退到 torch.optim.AdamW")
 
 
+TARGET_LOSS_CHANNELS = {
+    "mean_sea_level_pressure",
+    "10m_u_component_of_wind",
+    "10m_v_component_of_wind",
+    "2m_temperature",
+    "geopotential_850",
+    "geopotential_700",
+    "geopotential_500",
+    "specific_humidity_850",
+    "specific_humidity_700",
+    "specific_humidity_500",
+    "temperature_850",
+    "temperature_700",
+    "temperature_500",
+    "u_component_of_wind_500",
+    "v_component_of_wind_500",
+}
+
+def build_score_focused_weights(
+    channels,
+    base_weights,
+    target_weight=1.0,
+    aux_scale=0.5,
+    aux_min=0.03,
+    aux_max=0.15,
+):
+    weights = []
+    counts = {"target": 0, "auxiliary": 0}
+    for channel, base_weight in zip(channels, base_weights):
+        if channel in TARGET_LOSS_CHANNELS:
+            weights.append(target_weight)
+            counts["target"] += 1
+        else:
+            weights.append(min(aux_max, max(aux_min, float(base_weight) * aux_scale)))
+            counts["auxiliary"] += 1
+    return weights, counts
+
+
 def loss_func(x, y, weights, level_weight=1.0):
     return level_weight * (F.l1_loss(x, y, reduction='none') * weights).mean()
 
@@ -49,6 +87,26 @@ def build_scheduler(optimizer, epoch=0):
         group.setdefault("initial_lr", group["lr"])
     return torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=100, last_epoch=epoch - 1
+    )
+
+
+def build_optimizer(model, backbone_lr=5e-5, interface_lr=2e-4):
+    backbone_params = []
+    interface_params = []
+    for name, param in model.named_parameters():
+        param.requires_grad = True
+        if any(layer in name for layer in ["layer1", "layer2", "layer3", "layer4"]):
+            backbone_params.append(param)
+        else:
+            interface_params.append(param)
+
+    return FusedAdam(
+        [
+            {"params": backbone_params, "lr": backbone_lr},
+            {"params": interface_params, "lr": interface_lr},
+        ],
+        betas=(0.9, 0.999),
+        weight_decay=3e-6,
     )
 
 def main():
@@ -83,8 +141,19 @@ def main():
     train_dataloader, train_sampler = datapipe.train_dataloader()
     val_dataloader, val_sampler = datapipe.val_dataloader()
 
-    surface_weights = torch.as_tensor(cfg_data.dataset.weights[:4], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
-    pressure_weights = torch.as_tensor(cfg_data.dataset.weights[4:], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
+    score_weights, score_weight_counts = build_score_focused_weights(
+        cfg_data.dataset.channels,
+        cfg_data.dataset.weights,
+    )
+    surface_weights = torch.as_tensor(score_weights[:4], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
+    pressure_weights = torch.as_tensor(score_weights[4:], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
+    if world_rank == 0:
+        print(
+            "score-focused loss weights: "
+            f"target={score_weight_counts['target']}x1.0, "
+            f"auxiliary={score_weight_counts['auxiliary']} scaled from config weights "
+            "(clamp 0.03..0.15, scale=0.5)"
+        )
 
     land_mask = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "land_mask.npy")).astype(np.float32))
     soil_type = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "soil_type.npy")).astype(np.float32))
@@ -101,15 +170,11 @@ def main():
                   window_size=cfg.window_size,
                   depth=cfg.depth,
                   ).to(local_rank)
-
-    ## 剪枝检测
-    is_pruned = (cfg.depth[1] < 6 or cfg.depth[2] < 6)
-    ckpt_suffix = "_pruned" if is_pruned else ""
-
+    
     ## Train process init
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    train_loss_file = f"{cfg.checkpoint_dir}/trloss_288{ckpt_suffix}.npy"
-    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_288{ckpt_suffix}.npy"
+    train_loss_file = f"{cfg.checkpoint_dir}/trloss_288.npy"
+    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_288.npy"
     best_valid_loss = 1.0e6
     best_loss_epoch = 0
     train_losses = np.empty((0,), dtype=np.float32)
@@ -121,26 +186,23 @@ def main():
         print("\n\n")
         print("-" * 50)
         print(f"📂 now params is {total_params}, {total_params / 1e6:.2f}M, {total_params / 1e9:.2f}B")
-        if is_pruned:
-            pruned_l2 = 6 - cfg.depth[1]
-            pruned_l3 = 6 - cfg.depth[2]
-            print(f"✂️  Block 剪枝已启用: layer2={cfg.depth[1]}/6 (剪{pruned_l2}), layer3={cfg.depth[2]}/6 (剪{pruned_l3})")
         print("-" * 50, "\n")
 
     ## Checkpoint file names
-    best_ckpt_name = f"model_288{ckpt_suffix}_bak.pth"
-    latest_ckpt_name = f"model_288{ckpt_suffix}_latest.pth"
+    best_ckpt_name = "model_288_bak.pth"
+    latest_ckpt_name = "model_288_latest.pth"
     best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
-    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "60"))
+    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "600"))
 
     ## Load model weight if there exist well-trained model
     start_epoch = 0
     start_batch = 0
     loaded_resume = False
     resume_ckpt_data = None
-    freeze_transformer = False
-    unfreeze_epoch = int(os.environ.get("UNFREEZE_EPOCH", "999"))
+    reset_optimizer = os.environ.get("RESET_OPTIMIZER", "0") != "0"
+    backbone_lr = float(os.environ.get("BACKBONE_LR", "5e-5"))
+    interface_lr = float(os.environ.get("INTERFACE_LR", "2e-4"))
 
     # ---- Step 1: 断点续训（优先）：288 checkpoint = 继承全量模型训练后的结果 ----
     if os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path):
@@ -151,18 +213,9 @@ def main():
             print(f"loading resume checkpoint: {resume_ckpt}")
             print(f'删除此文件可重新从全量模型 warm start')
             print("-" * 50 + "\n")
-        ckpt = torch.load(resume_ckpt, map_location=f'cuda:{local_rank}', weights_only=False)
-        # 剪枝兼容：过滤掉 checkpoint 中不属于剪枝后模型的参数
-        model_state = model.state_dict()
-        src_state = ckpt["model_state_dict"]
-        filtered_state = {k: v for k, v in src_state.items() if k in model_state and model_state[k].shape == v.shape}
-        skipped_keys = [k for k in src_state if k not in model_state or (k in model_state and model_state[k].shape != src_state[k].shape)]
-        missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
-        if world_rank == 0 and skipped_keys:
-            print(f"✂️  续训跳过 {len(skipped_keys)} 个被剪枝参数: {skipped_keys[:5]}")
+        ckpt = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
         resume_ckpt_data = ckpt
-        best_valid_loss = ckpt.get("best_valid_loss", best_valid_loss)
-        best_loss_epoch = ckpt.get("best_loss_epoch", best_loss_epoch)
         saved_epoch = int(ckpt.get("epoch", -1))
         if ckpt.get("epoch_complete", True):
             start_epoch = saved_epoch + 1
@@ -170,13 +223,25 @@ def main():
         else:
             start_epoch = saved_epoch
             start_batch = int(ckpt.get("next_batch_idx", 0))
-        if os.path.exists(train_loss_file):
+
+        if reset_optimizer:
+            best_valid_loss = 1.0e6
+            best_loss_epoch = start_epoch
+            train_losses = np.empty((0,), dtype=np.float32)
+            valid_losses = np.empty((0,), dtype=np.float32)
+        else:
+            best_valid_loss = ckpt.get("best_valid_loss", best_valid_loss)
+            best_loss_epoch = ckpt.get("best_loss_epoch", best_loss_epoch)
+
+        if not reset_optimizer and os.path.exists(train_loss_file):
             train_losses = np.load(train_loss_file)
-        if os.path.exists(valid_loss_file):
+        if not reset_optimizer and os.path.exists(valid_loss_file):
             valid_losses = np.load(valid_loss_file)
         loaded_resume = True
         if world_rank == 0:
-            print(f"resume from epoch {start_epoch}, batch {start_batch}")
+            print(f"loaded checkpoint weights, resume training from epoch {start_epoch}, batch {start_batch}")
+            if reset_optimizer:
+                print("new loss/lr mode: loaded model weights and progress; optimizer/scheduler/best loss reset")
 
     # ---- Step 1 (备): warm start：无 288 checkpoint 时，从 244 全量权重部分迁移 ----
     elif os.path.exists(os.path.join(cfg.checkpoint_dir, "model_bak.pth")):
@@ -193,15 +258,12 @@ def main():
         model_state = model.state_dict()
         filtered_state = {}
         shape_mismatch_keys = []
-        pruned_keys = []
         for k, v in src_state.items():
             if k in model_state:
                 if model_state[k].shape == v.shape:
                     filtered_state[k] = v
                 else:
                     shape_mismatch_keys.append(k)
-            else:
-                pruned_keys.append(k)
 
         missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
         real_missing = [k for k in missing_keys if "attn_mask" not in k]
@@ -211,9 +273,6 @@ def main():
             if shape_mismatch_keys:
                 print(f"⚠️  {len(shape_mismatch_keys)} 个参数因 patch_size 变更跳过（形状不匹配）:")
                 print(f"   {shape_mismatch_keys[:10]}")
-            if pruned_keys:
-                print(f"✂️  {len(pruned_keys)} 个参数因剪枝跳过（被移除的 block）:")
-                print(f"   {pruned_keys[:10]}")
             print(f"   {len(real_missing)} 个参数随机初始化（patch_embed/recovery/downsample/upsample）")
             print(f"   attn_mask buffer {len(attn_mask_missing)} 个将自动重建")
             if real_missing:
@@ -224,54 +283,27 @@ def main():
         start_epoch = 0
         start_batch = 0
 
-    # ---- Step 2: 冻结策略（剪枝感知）----
-    if is_pruned:
-        # 剪枝模式：冻结 layer1，解冻 layer2/3/4（剪枝改变了结构，需重新训练）
-        frozen_layers = ["layer1"]
-        trainable_layers = ["layer2", "layer3", "layer4"]
-    else:
-        # 非剪枝模式：冻结所有 Transformer 层（原版行为）
-        frozen_layers = ["layer1", "layer2", "layer3", "layer4"]
-        trainable_layers = []
-
-    freeze_transformer = True
-    for name, param in model.named_parameters():
-        if any(layer in name for layer in frozen_layers):
-            param.requires_grad = False
-        elif any(layer in name for layer in trainable_layers):
-            param.requires_grad = True
-
-    # 解冻 earth_position_bias_table（形状因 patch_size 变更，需要从头学习）
-    for name, param in model.named_parameters():
-        if "earth_position_bias_table" in name:
-            param.requires_grad = True
-
     if world_rank == 0:
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
-        if is_pruned:
-            print(f"🔥 剪枝感知冻结：layer1 已冻结，layer2/3/4 已解冻微调，仅训练 {trainable}/{total} 参数 ({trainable/total*100:.1f}%)")
-        else:
-            print(f"🧊 Transformer 已冻结（QKV/MLP/LayerNorm），仅训练 {trainable}/{total} 参数 ({trainable/total*100:.1f}%)")
-        print(f"   earth_position_bias_table 已单独解冻，将从 trunc_normal 初始化开始学习")
-        if unfreeze_epoch < 999:
-            print(f"   将在 epoch {unfreeze_epoch} 解冻全部参数")
+        print(f"full fine-tune enabled: {total} parameters trainable")
+        print(f"optimizer lr groups: backbone(layer1-4)={backbone_lr}, interface={interface_lr}")
 
     raw_model = model  # 保留原始模型引用，用于 replace_function
     if world_rank == 0:
         print("torch.compile disabled; training will use eager mode")
 
-    ## Optimizer init（仅优化可训练参数，冻结的参数不进入 optimizer）
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = FusedAdam(trainable_params, betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6)
+    ## Optimizer init: low-lr full fine-tuning with separate backbone/interface groups.
+    optimizer = build_optimizer(model, backbone_lr=backbone_lr, interface_lr=interface_lr)
     scheduler = build_scheduler(optimizer)
 
-    ## 断点续训时恢复 optimizer/scheduler 状态
-    if resume_ckpt_data is not None:
+    ## Only restore optimizer/scheduler when explicitly requested.
+    if resume_ckpt_data is not None and not reset_optimizer:
         optimizer.load_state_dict(resume_ckpt_data["optimizer_state_dict"])
         scheduler.load_state_dict(resume_ckpt_data["scheduler_state_dict"])
         if world_rank == 0:
             print("✅ optimizer/scheduler 状态已恢复")
+    elif resume_ckpt_data is not None and world_rank == 0:
+        print("optimizer/scheduler initialized fresh for new loss/lr")
 
     # 续训时重建 DataLoader 跳过已处理 batch，避免逐个加载数据
     # 注意：仅用于续训 epoch，后续 epoch 必须恢复全量 DataLoader
@@ -305,19 +337,6 @@ def main():
         if dist.is_initialized():
             train_sampler.set_epoch(epoch)
             val_sampler.set_epoch(epoch)
-
-        # 解冻逻辑：到达指定 epoch 时解除 Transformer 冻结，全量微调
-        if freeze_transformer and epoch >= unfreeze_epoch:
-            for param in raw_model.parameters():
-                param.requires_grad = True
-            optimizer = FusedAdam(
-                [p for p in model.parameters() if p.requires_grad],
-                betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6
-            )
-            scheduler = build_scheduler(optimizer, epoch=epoch)
-            freeze_transformer = False
-            if world_rank == 0:
-                logger.info(f"🔓 epoch {epoch}: Transformer 已解冻，全量参数训练")
 
         model.train()
         train_loss = 0
@@ -406,7 +425,7 @@ def main():
 
         model.eval()
         valid_loss = 0
-        val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", "50"))
+        val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", "500"))
         if "VAL_MAX_BATCHES" in os.environ and "VAL_MAX_SAMPLES" not in os.environ:
             val_max_samples = int(os.environ["VAL_MAX_BATCHES"]) * cfg_data.dataloader.batch_size
         val_dataset = val_dataloader.dataset
