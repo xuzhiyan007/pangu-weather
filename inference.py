@@ -17,7 +17,7 @@ from pangu_patchsize import PanguPatchSize as Pangu
 POSITION_BIAS_NAME = "earth_position_bias_table"
 EXPECTED_DEPTH = (2, 6, 4, 2)
 DEFAULT_CHECKPOINT = os.path.join(
-    "data", "checkpoints", "model_288_pruned2642_light_int8_bf16.pth"
+    "data", "checkpoints", "model_288_channel288_light_int8_bf16.pth"
 )
 
 
@@ -178,6 +178,8 @@ def main():
         num_heads=cfg.num_heads,
         window_size=cfg.window_size,
         depth=EXPECTED_DEPTH,
+        pruned_dim=getattr(cfg, "pruned_dim", None),
+        pruned_num_heads=getattr(cfg, "pruned_num_heads", None),
     ).to(device=device, dtype=infer_dtype)
     missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
     bad_missing = [key for key in missing_keys if "attn_mask" not in key]
@@ -192,6 +194,10 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
     print(f"model depth: {list(EXPECTED_DEPTH)}")
+    pruned_dim = getattr(cfg, "pruned_dim", None)
+    if pruned_dim:
+        print(f"channel pruned: layer2/3 dim {cfg.embed_dim * 2} -> {pruned_dim}, "
+              f"num_heads {cfg.num_heads[1]} -> {getattr(cfg, 'pruned_num_heads', None)}")
     print(f"infer dtype: {infer_dtype}")
     print(f"int8 storage scope: {light_format.get('int8_scope', 'unknown')}")
     if missing_keys:

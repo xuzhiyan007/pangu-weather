@@ -207,10 +207,10 @@ def convert_checkpoint(
 
 
 DEFAULT_SOURCE = os.path.join(
-    "data", "checkpoints", "model_288_pruned2642_latest.pth"
+    "data", "checkpoints", "model_288_channel288_init.pth"
 )
 DEFAULT_TARGET = os.path.join(
-    "data", "checkpoints", "model_288_pruned2642_light_int8_bf16.pth"
+    "data", "checkpoints", "model_288_channel288_light_int8_bf16.pth"
 )
 
 

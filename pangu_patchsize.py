@@ -38,15 +38,24 @@ class PanguPatchSize(nn.Module):
         num_heads=(6, 12, 12, 6),
         window_size=(2, 6, 12),
         depth=(2, 6, 6, 2),
+        pruned_dim=None,
+        pruned_num_heads=None,
     ):
         super().__init__()
         self.depth = tuple(depth)
+        self.pruned_dim = pruned_dim
+        self.pruned_num_heads = pruned_num_heads
         drop_path = np.linspace(0, 0.2, 8).tolist()
 
         # ---- block 级剪枝信息 ----
         is_pruned = self.depth[1] < 6 or self.depth[2] < 6
         if is_pruned:
-            print(f"✂️  PanguPatchSize 剪枝: layer2={self.depth[1]}/6, layer3={self.depth[2]}/6")
+            print(f"✂️  PanguPatchSize 块剪枝: layer2={self.depth[1]}/6, layer3={self.depth[2]}/6")
+
+        # ---- 通道剪枝信息 ----
+        if pruned_dim is not None:
+            print(f"✂️  PanguPatchSize 通道剪枝: layer2/3 dim {embed_dim * 2} → {pruned_dim}, "
+                  f"num_heads {num_heads[1]} → {pruned_num_heads}")
 
         # ---- Patch Embedding（与原版一致）----
         self.patchembed2d = OneEmbedding(
@@ -87,33 +96,44 @@ class PanguPatchSize(nn.Module):
             math.ceil(patched_input_shape[2] / 2),
         )
 
+        # ---- 通道剪枝：layer2/3 的 dim 和 num_heads ----
+        layer23_dim = pruned_dim if pruned_dim is not None else embed_dim * 2
+        layer23_heads = pruned_num_heads if pruned_num_heads is not None else num_heads[1]
+
         self.downsample = OneSample(
             style="PanguDownSample",
             in_dim=embed_dim,
             input_resolution=patched_input_shape,
             output_resolution=patched_downsampled_shape,
         )
+        # 通道剪枝时替换 downsample 的输出维度
+        if pruned_dim is not None:
+            self.downsample.sampler.linear = nn.Linear(
+                embed_dim * 4, pruned_dim, bias=False
+            )
+            # Sampler 是 sampler 的别名，同一对象无需重复赋值
+
         self.layer2 = OneFuser(
             style="PanguFuser",
-            dim=embed_dim * 2,
+            dim=layer23_dim,
             input_resolution=patched_downsampled_shape,
             depth=self.depth[1],
-            num_heads=num_heads[1],
+            num_heads=layer23_heads,
             window_size=window_size,
             drop_path=drop_path[2 : 2 + self.depth[1]],
         )
         self.layer3 = OneFuser(
             style="PanguFuser",
-            dim=embed_dim * 2,
+            dim=layer23_dim,
             input_resolution=patched_downsampled_shape,
             depth=self.depth[2],
-            num_heads=num_heads[2],
+            num_heads=layer23_heads,
             window_size=window_size,
             drop_path=drop_path[2 : 2 + self.depth[2]],
         )
         self.upsample = OneSample(
             style="PanguUpSample",
-            in_dim=embed_dim * 2,
+            in_dim=layer23_dim,
             out_dim=embed_dim,
             input_resolution=patched_downsampled_shape,
             output_resolution=patched_input_shape,

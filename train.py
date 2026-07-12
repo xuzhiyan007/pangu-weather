@@ -226,18 +226,28 @@ def main():
     surface_mask = surface_mask.unsqueeze(0)  # [1, 3, H, W], 循环中用 expand 动态匹配 batch_size
 
     ## Model init
+    pruned_dim = getattr(cfg, "pruned_dim", None)
+    pruned_num_heads = getattr(cfg, "pruned_num_heads", None)
     model = Pangu(img_size=cfg_data.dataset.img_size,
                   patch_size=cfg.patch_size,
                   embed_dim=cfg.embed_dim,
                   num_heads=cfg.num_heads,
                   window_size=cfg.window_size,
                   depth=cfg.depth,
+                  pruned_dim=pruned_dim,
+                  pruned_num_heads=pruned_num_heads,
                   ).to(local_rank)
     
     ## Train process init
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     run_tag = os.environ.get("RUN_TAG", "").strip()
-    # 剪枝 warm start 时若未指定 RUN_TAG，自动生成以避免覆盖原始 checkpoint
+    # 通道剪枝 warm start 时优先生成 channel 标签
+    if not run_tag and os.environ.get("CHANNEL_PRUNE_FROM", "").strip():
+        tag_dim = pruned_dim if pruned_dim else "ch"
+        run_tag = f"channel{tag_dim}"
+        if world_rank == 0:
+            print(f"📌 CHANNEL_PRUNE_FROM 已设置，自动生成 RUN_TAG={run_tag}")
+    # 块剪枝 warm start 时若未指定 RUN_TAG，自动生成以避免覆盖原始 checkpoint
     if not run_tag and os.environ.get("PRUNE_FROM", "").strip():
         run_tag = "pruned2642"
         if world_rank == 0:
@@ -293,9 +303,52 @@ def main():
             "KD_INTERFACE_ONLY=1 requires FREEZE_BACKBONE_EPOCHS > 0"
         )
 
-    # ---- Step 0 (剪枝 warm start): 从全量 checkpoint 做结构剪枝的权重迁移 ----
+    # ---- Step -1 (通道剪枝 warm start): 从通道剪枝 checkpoint 加载 ----
+    channel_prune_from = os.environ.get("CHANNEL_PRUNE_FROM", "").strip()
     prune_from = os.environ.get("PRUNE_FROM", "").strip()
-    if prune_from:
+    if channel_prune_from:
+        if not os.path.exists(channel_prune_from):
+            raise FileNotFoundError(f"CHANNEL_PRUNE_FROM checkpoint not found: {channel_prune_from}")
+        if world_rank == 0:
+            print("\n")
+            print("-" * 50)
+            print(f"✂️  通道剪枝 warm start: 从 {channel_prune_from} 加载权重")
+            print(f"   pruned_dim={pruned_dim}, pruned_num_heads={pruned_num_heads}")
+            print("-" * 50 + "\n")
+        ckpt = torch.load(channel_prune_from, map_location="cpu", weights_only=False)
+        src_state = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+
+        model_state = model.state_dict()
+        filtered_state = {}
+        skipped_keys = []
+        for k, v in src_state.items():
+            if k in model_state:
+                if model_state[k].shape == v.shape:
+                    filtered_state[k] = v
+                else:
+                    skipped_keys.append(k)
+
+        missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
+        real_missing = [k for k in missing_keys if "attn_mask" not in k]
+        attn_mask_missing = [k for k in missing_keys if "attn_mask" in k]
+
+        if world_rank == 0:
+            print(f"✅ 已加载 {len(filtered_state)} 个参数")
+            if skipped_keys:
+                print(f"⚠️  {len(skipped_keys)} 个参数因形状不匹配跳过: {skipped_keys[:10]}")
+            print(f"   {len(real_missing)} 个参数随机初始化")
+            print(f"   attn_mask buffer {len(attn_mask_missing)} 个将自动重建")
+            print(f"   optimizer/scheduler 从头初始化，从 epoch 0 开始训练")
+
+        start_epoch = 0
+        start_batch = 0
+        if "BACKBONE_LR" not in os.environ:
+            backbone_lr = 2e-5
+        if "INTERFACE_LR" not in os.environ:
+            interface_lr = 1e-4
+
+    # ---- Step 0 (块剪枝 warm start): 从全量 checkpoint 做结构剪枝的权重迁移 ----
+    elif prune_from:
         if not os.path.exists(prune_from):
             raise FileNotFoundError(f"PRUNE_FROM checkpoint not found: {prune_from}")
         if world_rank == 0:

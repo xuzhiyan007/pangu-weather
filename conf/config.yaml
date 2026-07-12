@@ -12,6 +12,12 @@ model:
     # 训练命令: PRUNE_FROM=data/checkpoints/model_288_latest.pth python train.py
     depth: [2, 6, 4, 2]
     patience: 50
+    # ---- 通道剪枝配置 ----
+    # pruned_dim: layer2/3 的 embedding 维度从 embed_dim*2(384) 剪到指定值
+    # pruned_num_heads: layer2/3 的注意力头数（head_dim 保持 32 不变）
+    # 设为 null 或注释掉则不启用通道剪枝
+    pruned_dim: 288
+    pruned_num_heads: 9
     checkpoint_dir: "./data/checkpoints"         # AI4S，路径不可更改
 
 student_model:
