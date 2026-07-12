@@ -10,7 +10,7 @@ model:
     # 方案B: layer3_depth=4（剪掉 block4/5，保留 block0/1/2/3）→ depth: [2, 6, 4, 2]
     # 消融实验显示 block4/5 偏差最低（0.080/0.096），是 layer3 中最安全的剪枝目标
     # 训练命令: PRUNE_FROM=data/checkpoints/model_288_latest.pth python train.py
-    depth: [2, 6, 4, 2]
+    depth: [2, 6, 3, 2]
     patience: 50
     checkpoint_dir: "./data/checkpoints"         # AI4S，路径不可更改
 

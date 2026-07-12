@@ -146,11 +146,11 @@ def count_kept_train_batches(num_batches, epoch, skip_stride, max_batches):
     return kept
 
 
-def build_scheduler(optimizer, epoch=0):
+def build_scheduler(optimizer, epoch=0, T_max=100):
     for group in optimizer.param_groups:
         group.setdefault("initial_lr", group["lr"])
     return torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=100, last_epoch=epoch - 1
+        optimizer, T_max=T_max, last_epoch=epoch - 1
     )
 
 
@@ -239,7 +239,7 @@ def main():
     run_tag = os.environ.get("RUN_TAG", "").strip()
     # 剪枝 warm start 时若未指定 RUN_TAG，自动生成以避免覆盖原始 checkpoint
     if not run_tag and os.environ.get("PRUNE_FROM", "").strip():
-        run_tag = "pruned2642"
+        run_tag = "pruned2632"
         if world_rank == 0:
             print(f"📌 PRUNE_FROM 已设置，自动生成 RUN_TAG={run_tag} 以保护原始 checkpoint")
     if run_tag and not all(char.isalnum() or char in "-_" for char in run_tag):
@@ -482,7 +482,10 @@ def main():
 
     ## Optimizer init: low-lr full fine-tuning with separate backbone/interface groups.
     optimizer = build_optimizer(model, backbone_lr=backbone_lr, interface_lr=interface_lr)
-    scheduler = build_scheduler(optimizer)
+    t_max = int(os.environ.get("T_MAX", str(cfg.max_epoch)))
+    scheduler = build_scheduler(optimizer, epoch=start_epoch, T_max=t_max)
+    if world_rank == 0:
+        print(f"scheduler: CosineAnnealingLR T_max={t_max}, start_epoch={start_epoch}")
 
     freeze_until_epoch = start_epoch + max(0, freeze_backbone_epochs)
     if kd_enabled:

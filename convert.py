@@ -1,4 +1,4 @@
-"""Convert the [2, 6, 4, 2] pruned checkpoint with convert1's INT8 scheme."""
+"""Convert the [2, 6, 3, 2] pruned checkpoint with convert1's INT8 scheme."""
 
 import argparse
 import os
@@ -194,7 +194,7 @@ def convert_checkpoint(
             "dropped_duplicate_fuser_tensors": (
                 "Fuser duplicates fuser when tensor values are equal"
             ),
-            "model_depth": [2, 6, 4, 2],
+            "model_depth": [2, 6, 3, 2],
         },
     }
     target_dir = os.path.dirname(dst_path)
@@ -207,10 +207,10 @@ def convert_checkpoint(
 
 
 DEFAULT_SOURCE = os.path.join(
-    "data", "checkpoints", "model_288_pruned2642_latest.pth"
+    "data", "checkpoints", "model_288_pruned2632_latest.pth"
 )
 DEFAULT_TARGET = os.path.join(
-    "data", "checkpoints", "model_288_pruned2642_light_int8_bf16.pth"
+    "data", "checkpoints", "model_288_pruned2632_light_int8_bf16.pth"
 )
 
 
@@ -218,7 +218,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Apply convert1's all-2D-weight INT8 storage format to the "
-            "depth=[2,6,4,2] pruned model."
+            "depth=[2,6,3,2] pruned model."
         )
     )
     parser.add_argument("--src", default=DEFAULT_SOURCE)
@@ -248,7 +248,7 @@ def main():
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
     print(f"source pruned checkpoint: {args.src}")
     print(f"target light checkpoint: {args.dst}")
-    print("expected model depth: [2, 6, 4, 2]")
+    print("expected model depth: [2, 6, 3, 2]")
     print(f"normal tensor dtype: {args.dtype}")
     print(f"{POSITION_BIAS_NAME}: {args.position_bias_dtype}")
     if args.linear_group_size > 0:
@@ -279,7 +279,7 @@ def main():
     print(f"  compression: {src_mb / dst_mb:.2f}x")
     print(f"  saved: {(1.0 - dst_mb / src_mb) * 100:.1f}%")
     print("\nrun:")
-    print(f"  LIGHT_CKPT={args.dst} python inference1.py")
+    print(f"  LIGHT_CKPT={args.dst} python inference.py")
 
 
 if __name__ == "__main__":

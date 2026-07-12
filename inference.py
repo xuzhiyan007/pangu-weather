@@ -1,4 +1,4 @@
-"""Standalone inference for the depth=[2, 6, 4, 2] INT8 Pangu model."""
+"""Standalone inference for the depth=[2, 6, 3, 2] INT8 Pangu model."""
 
 import json
 import os
@@ -15,9 +15,9 @@ from pangu_patchsize import PanguPatchSize as Pangu
 
 
 POSITION_BIAS_NAME = "earth_position_bias_table"
-EXPECTED_DEPTH = (2, 6, 4, 2)
+EXPECTED_DEPTH = (2, 6, 3, 2)
 DEFAULT_CHECKPOINT = os.path.join(
-    "data", "checkpoints", "model_288_pruned2642_light_int8_bf16.pth"
+    "data", "checkpoints", "model_288_pruned2632_light_int8_bf16.pth"
 )
 
 
@@ -90,7 +90,7 @@ def unpack_pruned_checkpoint(checkpoint, infer_dtype):
             f"Checkpoint depth is {checkpoint_depth}, expected {EXPECTED_DEPTH}"
         )
     if light_format.get("int4_scope") not in (None, "none"):
-        raise ValueError("inference2642.py does not accept INT4 checkpoints")
+        raise ValueError("inference2632.py does not accept INT4 checkpoints")
 
     state_dict = dict(checkpoint.get("model_state_dict", checkpoint))
     group_size = int(light_format.get("mlp_group_size", 0))
@@ -159,7 +159,7 @@ def main():
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"Cannot find pruned light checkpoint: {checkpoint_path}. "
-            "Run python convert2642.py first."
+            "Run python convert2632.py first."
         )
 
     device = torch.device("cuda:0")
