@@ -230,11 +230,11 @@ def rebuild_dataloader_with_subset(dataloader, indices):
     )
 
 
-def build_scheduler(optimizer, epoch=0):
+def build_scheduler(optimizer, epoch=0, t_max=100):
     for group in optimizer.param_groups:
         group.setdefault("initial_lr", group["lr"])
     return torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=100, last_epoch=epoch - 1
+        optimizer, T_max=t_max, last_epoch=epoch - 1
     )
 
 
@@ -663,7 +663,7 @@ def main():
 
     ## Optimizer init: low-lr full fine-tuning with separate backbone/interface groups.
     optimizer = build_optimizer(model, backbone_lr=backbone_lr, interface_lr=interface_lr)
-    scheduler = build_scheduler(optimizer)
+    scheduler = build_scheduler(optimizer, t_max=cfg.max_epoch)
 
     freeze_until_epoch = start_epoch + max(0, freeze_backbone_epochs)
     if kd_enabled:
