@@ -246,8 +246,8 @@ def main():
     if run_tag and not all(char.isalnum() or char in "-_" for char in run_tag):
         raise ValueError("RUN_TAG may contain only letters, digits, '-' and '_'")
     artifact_suffix = f"_{run_tag}" if run_tag else ""
-    train_loss_file = f"{cfg.checkpoint_dir}/trloss_299{artifact_suffix}.npy"
-    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_299{artifact_suffix}.npy"
+    train_loss_file = f"{cfg.checkpoint_dir}/trloss_2_10_10{artifact_suffix}.npy"
+    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_2_10_10{artifact_suffix}.npy"
     best_valid_loss = 1.0e6
     best_loss_epoch = 0
     train_losses = np.empty((0,), dtype=np.float32)
@@ -262,11 +262,11 @@ def main():
         print("-" * 50, "\n")
 
     ## Checkpoint file names
-    best_ckpt_name = f"model_299{artifact_suffix}_bak.pth"
-    latest_ckpt_name = f"model_299{artifact_suffix}_latest.pth"
+    best_ckpt_name = f"model_2_10_10{artifact_suffix}_bak.pth"
+    latest_ckpt_name = f"model_2_10_10{artifact_suffix}_latest.pth"
     best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
-    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "600"))
+    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "120"))
 
     ## Load model weight if there exist well-trained model
     start_epoch = 0
@@ -362,7 +362,7 @@ def main():
         if "INTERFACE_LR" not in os.environ:
             interface_lr = 1e-4
 
-    # ---- Step 1: 断点续训（优先）：299 checkpoint = 继承全量模型训练后的结果 ----
+    # ---- Step 1: 断点续训（优先）：2_10_10 checkpoint = 继承全量模型训练后的结果 ----
     elif os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path):
         resume_ckpt = latest_ckpt_path if os.path.exists(latest_ckpt_path) else best_ckpt_path
         if world_rank == 0:
@@ -439,7 +439,7 @@ def main():
             if reset_optimizer:
                 print("new loss/lr mode: loaded model weights and progress; optimizer/scheduler/best loss reset")
 
-    # ---- Step 1 (备): warm start：无 299 checkpoint 时，从 244 全量权重部分迁移 ----
+    # ---- Step 1 (备): warm start：无 2_10_10 checkpoint 时，从 244 全量权重部分迁移 ----
     elif os.path.exists(os.path.join(cfg.checkpoint_dir, "model_bak.pth")):
         warm_start_path = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
         if world_rank == 0:

@@ -17,7 +17,7 @@ from pangu_patchsize import PanguPatchSize as Pangu
 POSITION_BIAS_NAME = "earth_position_bias_table"
 EXPECTED_DEPTH = (2, 6, 4, 2)
 DEFAULT_CHECKPOINT = os.path.join(
-    "data", "checkpoints", "model_299_299_light_int8_bf16.pth"
+    "data", "checkpoints", "model_2_10_10_pruned2642_light_int8_bf16.pth"
 )
 
 
