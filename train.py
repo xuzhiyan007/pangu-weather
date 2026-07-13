@@ -5,6 +5,8 @@ import numpy as np
 import torch.distributed as dist
 import logging
 import time
+import calendar
+from datetime import date
 from torch.nn.parallel import DistributedDataParallel
 # from onescience.models.pangu import Pangu
 from pangu_patchsize import PanguPatchSize as Pangu
@@ -16,6 +18,7 @@ from torch.cuda.amp import autocast
 from distill_utils import (
     get_kd_alpha,
     init_bias_table_from_source,
+    init_patch_embed_from_official,
     init_patch_embed_from_source,
     load_teacher_model,
     reset_interface_from_official,
@@ -49,7 +52,15 @@ TARGET_LOSS_CHANNELS = {
     "u_component_of_wind_500",
     "v_component_of_wind_500",
 }
-LOSS_VERSION = "score_aligned_mse_acc_v1"
+LATITUDE_WEIGHTED_LOSS = os.environ.get("LATITUDE_WEIGHTED_LOSS", "1") != "0"
+LOSS_VERSION = (
+    "score_aligned_mse_acc_v1_latitude"
+    if LATITUDE_WEIGHTED_LOSS
+    else "score_aligned_mse_acc_v1_gridpoint"
+)
+COMPATIBLE_LOSS_VERSIONS = {LOSS_VERSION}
+if LATITUDE_WEIGHTED_LOSS:
+    COMPATIBLE_LOSS_VERSIONS.add("score_aligned_mse_acc_v1")
 
 
 def build_target_channel_indices(channels):
@@ -63,7 +74,9 @@ def build_target_channel_indices(channels):
     ]
 
 
-def build_latitude_weights(height, device):
+def build_latitude_weights(height, device, latitude_weighted=True):
+    if not latitude_weighted:
+        return torch.ones(1, 1, height, 1, device=device, dtype=torch.float32)
     latitudes = torch.linspace(90.0, -90.0, height, device=device, dtype=torch.float32)
     weights = torch.cos(torch.deg2rad(latitudes)).clamp_min(0.0)
     return weights.view(1, 1, height, 1)
@@ -113,6 +126,8 @@ def score_aligned_loss(
         "mse": scored_mse.detach(),
         "acc": correlation.mean().detach(),
         "aux": auxiliary_loss.detach(),
+        "field_mse": per_field_mse.mean(dim=0).detach(),
+        "field_acc": correlation.mean(dim=0).detach(),
     }
     return total, components
 
@@ -145,6 +160,74 @@ def count_kept_train_batches(num_batches, epoch, skip_stride, max_batches):
         if kept >= max_batches:
             break
     return kept
+
+
+def build_balanced_monthly_indices(dataset, years, days_per_month=10, seed=42):
+    """Build a deterministic year/month/time-balanced subset without loading samples."""
+    years = [int(year) for year in years]
+    if not years:
+        raise ValueError("Balanced sampling requires at least one training year")
+    if days_per_month <= 0:
+        return list(range(len(dataset)))
+
+    if hasattr(dataset, "datasets") and len(dataset.datasets) == len(years):
+        year_lengths = [len(year_dataset) for year_dataset in dataset.datasets]
+    else:
+        if len(dataset) % len(years) != 0:
+            raise ValueError(
+                "Cannot infer per-year dataset boundaries for balanced sampling: "
+                f"dataset={len(dataset)}, years={len(years)}"
+            )
+        samples_per_year = len(dataset) // len(years)
+        year_lengths = [samples_per_year] * len(years)
+
+    indices = []
+    offset = 0
+    for year, year_length in zip(years, year_lengths):
+        year_start = date(year, 1, 1)
+        for month in range(1, 13):
+            days_in_month = calendar.monthrange(year, month)[1]
+            selected_days = sorted(
+                {
+                    round((slot + 1) * (days_in_month + 1) / (days_per_month + 1))
+                    for slot in range(days_per_month)
+                }
+            )
+            if len(selected_days) != days_per_month:
+                raise RuntimeError(
+                    f"Could not select {days_per_month} unique days for {year}-{month:02d}"
+                )
+            for day in selected_days:
+                day_offset = (date(year, month, day) - year_start).days
+                for time_slot in range(4):
+                    local_index = day_offset * 4 + time_slot
+                    if local_index >= year_length:
+                        raise IndexError(
+                            "Balanced sample index exceeds year dataset: "
+                            f"year={year}, local_index={local_index}, length={year_length}"
+                        )
+                    indices.append(offset + local_index)
+        offset += year_length
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(indices)
+    return indices
+
+
+def rebuild_dataloader_with_subset(dataloader, indices):
+    subset = Subset(dataloader.dataset, indices)
+    return torch.utils.data.DataLoader(
+        subset,
+        batch_size=dataloader.batch_size,
+        num_workers=dataloader.num_workers,
+        pin_memory=dataloader.pin_memory,
+        drop_last=dataloader.drop_last,
+        shuffle=False,
+        collate_fn=dataloader.collate_fn,
+        persistent_workers=(
+            dataloader.persistent_workers if dataloader.num_workers > 0 else False
+        ),
+    )
 
 
 def build_scheduler(optimizer, epoch=0):
@@ -206,16 +289,48 @@ def main():
     train_dataloader, train_sampler = datapipe.train_dataloader()
     val_dataloader, val_sampler = datapipe.val_dataloader()
 
+    balanced_days_per_month = int(
+        os.environ.get(
+            "BALANCED_DAYS_PER_MONTH",
+            str(getattr(cfg_data.dataset, "balanced_days_per_month", 0)),
+        )
+    )
+    if balanced_days_per_month > 0:
+        if train_sampler is not None:
+            raise RuntimeError("Balanced monthly sampling currently requires single-device training")
+        balanced_indices = build_balanced_monthly_indices(
+            train_dataloader.dataset,
+            cfg_data.dataset.train_ratio,
+            days_per_month=balanced_days_per_month,
+            seed=int(getattr(cfg_data.dataset, "random_seed", 42)),
+        )
+        train_dataloader = rebuild_dataloader_with_subset(
+            train_dataloader, balanced_indices
+        )
+        if world_rank == 0:
+            print(
+                "balanced monthly training subset: "
+                f"years={len(cfg_data.dataset.train_ratio)}, "
+                f"days/month={balanced_days_per_month}, "
+                f"four times/day, samples={len(balanced_indices)}"
+            )
+
     target_channel_indices = build_target_channel_indices(cfg_data.dataset.channels)
     target_indices = torch.as_tensor(target_channel_indices, device=local_rank, dtype=torch.long)
-    latitude_weights = build_latitude_weights(cfg_data.dataset.img_size[0], local_rank)
+    latitude_weights = build_latitude_weights(
+        cfg_data.dataset.img_size[0],
+        local_rank,
+        latitude_weighted=LATITUDE_WEIGHTED_LOSS,
+    )
     score_mse_weight = float(os.environ.get("SCORE_MSE_WEIGHT", "0.8"))
     score_acc_weight = float(os.environ.get("SCORE_ACC_WEIGHT", "0.2"))
     auxiliary_loss_weight = float(os.environ.get("AUXILIARY_LOSS_WEIGHT", "0.05"))
     if world_rank == 0:
         print(
             "score-aligned loss: "
-            f"15 scored fields equally weighted, latitude-weighted MSE={score_mse_weight}, "
+            f"15 scored fields equally weighted, "
+            f"spatial weighting={'cos(latitude)' if LATITUDE_WEIGHTED_LOSS else 'gridpoint-equal'}, "
+            f"MSE={score_mse_weight}, "
             f"spatial ACC proxy={score_acc_weight}, auxiliary MSE={auxiliary_loss_weight}"
         )
 
@@ -244,7 +359,8 @@ def main():
         if world_rank == 0:
             print(f"📌 PRUNE_FROM 已设置，自动生成 RUN_TAG={run_tag} 以保护原始 checkpoint")
     if run_tag and not all(char.isalnum() or char in "-_" for char in run_tag):
-        raise ValueError("RUN_TAG may contain only letters, digits, '-' and '_'")
+        raise ValueError("RUN_TAG may contain only letters, digits, '-' and '_")
+    warm_start_from = os.environ.get("WARM_START_FROM", "").strip()
     artifact_suffix = f"_{run_tag}" if run_tag else ""
     train_loss_file = f"{cfg.checkpoint_dir}/trloss_2_10_10{artifact_suffix}.npy"
     valid_loss_file = f"{cfg.checkpoint_dir}/valoss_2_10_10{artifact_suffix}.npy"
@@ -266,7 +382,7 @@ def main():
     latest_ckpt_name = f"model_2_10_10{artifact_suffix}_latest.pth"
     best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
-    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "120"))
+    save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "600"))
 
     ## Load model weight if there exist well-trained model
     start_epoch = 0
@@ -294,9 +410,40 @@ def main():
             "KD_INTERFACE_ONLY=1 requires FREEZE_BACKBONE_EPOCHS > 0"
         )
 
-    # ---- Step 0 (剪枝 warm start): 从全量 checkpoint 做结构剪枝的权重迁移 ----
     prune_from = os.environ.get("PRUNE_FROM", "").strip()
-    if prune_from:
+    # ---- Auto-resume: PRUNE_FROM 已设置但已有同 RUN_TAG 的 checkpoint 时，自动续训 ----
+    force_reprune = os.environ.get("FORCE_REPRUNE", "0") != "0"
+    if prune_from and not force_reprune and (os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path)):
+        if world_rank == 0:
+            print("\n" + "-" * 50)
+            print(f"📌 PRUNE_FROM 已设置，但发现已有剪枝 checkpoint: {latest_ckpt_path}")
+            print(f"   自动切换为续训模式（如需重新剪枝请设置 FORCE_REPRUNE=1 或删除该 checkpoint）")
+            print("-" * 50 + "\n")
+        prune_from = ""  # 清空以落入续训分支
+    # ---- New data curriculum: inherit model weights only and start fresh progress. ----
+    if warm_start_from:
+        if not os.path.exists(warm_start_from):
+            raise FileNotFoundError(f"WARM_START_FROM checkpoint not found: {warm_start_from}")
+        if world_rank == 0:
+            print("\n" + "-" * 50)
+            print(f"warm start from: {warm_start_from}")
+            print("loading model weights only; optimizer/scheduler/progress reset")
+            print("-" * 50 + "\n")
+        ckpt = torch.load(warm_start_from, map_location="cpu", weights_only=False)
+        source_state = ckpt.get("model_state_dict", ckpt)
+        model.load_state_dict(source_state, strict=True)
+        start_epoch = 0
+        start_batch = 0
+        reset_optimizer = True
+        best_valid_loss = 1.0e6
+        best_loss_epoch = 0
+        train_losses = np.empty((0,), dtype=np.float32)
+        valid_losses = np.empty((0,), dtype=np.float32)
+        if world_rank == 0:
+            logger.info(f"loaded model weights from {warm_start_from}")
+
+    # ---- Step 0 (剪枝 warm start): 从全量 checkpoint 做结构剪枝的权重迁移 ----
+    elif prune_from:
         if not os.path.exists(prune_from):
             raise FileNotFoundError(f"PRUNE_FROM checkpoint not found: {prune_from}")
         if world_rank == 0:
@@ -377,7 +524,7 @@ def main():
         if world_rank == 0:
             logger.info(f"loaded student weights from {resume_ckpt}")
         checkpoint_loss_version = ckpt.get("loss_version")
-        if checkpoint_loss_version != LOSS_VERSION:
+        if checkpoint_loss_version not in COMPATIBLE_LOSS_VERSIONS:
             loss_definition_changed = True
             reset_optimizer = True
             if world_rank == 0:
@@ -591,17 +738,15 @@ def main():
     if start_batch > 0 and train_sampler is None:
         dataset = train_dataloader.dataset
         skip_samples = start_batch * cfg_data.dataloader.batch_size
-        subset = Subset(dataset, range(skip_samples, len(dataset)))
-        resume_dataloader = torch.utils.data.DataLoader(
-            subset,
-            batch_size=cfg_data.dataloader.batch_size,
-            num_workers=train_dataloader.num_workers,
-            pin_memory=train_dataloader.pin_memory,
-            drop_last=train_dataloader.drop_last,
-            shuffle=False,
+        resume_dataloader = rebuild_dataloader_with_subset(
+            train_dataloader,
+            range(skip_samples, len(dataset)),
         )
         if world_rank == 0:
-            print(f"DataLoader rebuilt: {start_batch} batches skipped, {len(subset)} samples remain")
+            print(
+                f"DataLoader rebuilt: {start_batch} batches skipped, "
+                f"{len(resume_dataloader.dataset)} samples remain"
+            )
         start_batch = 0
 
     ## Distributed model
@@ -776,6 +921,8 @@ def main():
         valid_mse = 0
         valid_acc = 0
         valid_aux = 0
+        valid_field_mse = np.zeros(len(target_channel_indices), dtype=np.float64)
+        valid_field_acc = np.zeros(len(target_channel_indices), dtype=np.float64)
         val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", "500"))
         if "VAL_MAX_BATCHES" in os.environ and "VAL_MAX_SAMPLES" not in os.environ:
             val_max_samples = int(os.environ["VAL_MAX_BATCHES"]) * cfg_data.dataloader.batch_size
@@ -832,6 +979,8 @@ def main():
                 valid_mse += loss_components["mse"].item()
                 valid_acc += loss_components["acc"].item()
                 valid_aux += loss_components["aux"].item()
+                valid_field_mse += loss_components["field_mse"].cpu().numpy()
+                valid_field_acc += loss_components["field_acc"].cpu().numpy()
                 val_processed += 1
                 if world_rank == 0:
                     seen_samples = min(val_processed * cfg_data.dataloader.batch_size, val_max_samples)
@@ -845,6 +994,17 @@ def main():
                             f'aux:{valid_aux / val_processed:.04f}')
                 
         valid_loss /= max(1, val_processed)
+        valid_field_mse /= max(1, val_processed)
+        valid_field_acc /= max(1, val_processed)
+        if world_rank == 0 and os.environ.get("LOG_CHANNEL_METRICS", "1") != "0":
+            logger.info("Validation metrics by scored field:")
+            for channel_index, field_mse, field_acc in zip(
+                target_channel_indices, valid_field_mse, valid_field_acc
+            ):
+                logger.info(
+                    f"  {cfg_data.dataset.channels[channel_index]}: "
+                    f"mse={field_mse:.6f}, acc={field_acc:.6f}"
+                )
         is_save_ckp = False
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss

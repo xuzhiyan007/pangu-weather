@@ -196,7 +196,7 @@ def init_bias_table_from_source(model, src_ckpt_path, device="cpu", log_fn=print
 def load_teacher_model(ckpt_path, img_size, device,
                        depth=(2, 6, 6, 2), patch_size=(2, 4, 4),
                        embed_dim=192, num_heads=(6, 12, 12, 6),
-                       window_size=(2, 6, 12), log_fn=print):
+                       window_size=(2, 6, 12), dtype=None, log_fn=print):
     """
     加载源模型作为 teacher。
 
@@ -215,6 +215,8 @@ def load_teacher_model(ckpt_path, img_size, device,
         window_size=window_size,
         depth=depth,
     ).to(device)
+    if dtype is not None:
+        teacher = teacher.to(dtype=dtype)
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     src_state = ckpt.get("model_state_dict", ckpt)
