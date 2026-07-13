@@ -52,6 +52,21 @@ TARGET_LOSS_CHANNELS = {
     "u_component_of_wind_500",
     "v_component_of_wind_500",
 }
+
+
+def parse_int_tuple(value, name, expected_length):
+    """Parse comma-separated integer model settings from environment variables."""
+    try:
+        parsed = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be comma-separated integers, got {value!r}") from exc
+    if len(parsed) != expected_length:
+        raise ValueError(
+            f"{name} must contain {expected_length} integers, got {parsed}"
+        )
+    return parsed
+
+
 LATITUDE_WEIGHTED_LOSS = os.environ.get("LATITUDE_WEIGHTED_LOSS", "1") != "0"
 LOSS_VERSION = (
     "score_aligned_mse_acc_v1_latitude"
@@ -214,6 +229,63 @@ def build_balanced_monthly_indices(dataset, years, days_per_month=10, seed=42):
     return indices
 
 
+def build_every_n_days_indices(dataset, years, day_stride=3, seed=42):
+    """Select one complete day every ``day_stride`` days, then shuffle globally.
+
+    ERA5 has four six-hourly samples per day.  For every selected calendar day,
+    all four time slots are retained.  Year boundaries are taken from the
+    concatenated per-year datasets so leap years remain aligned correctly.
+    """
+    years = [int(year) for year in years]
+    if not years:
+        raise ValueError("Every-N-days sampling requires at least one training year")
+    if day_stride <= 0:
+        return list(range(len(dataset)))
+
+    if hasattr(dataset, "datasets") and len(dataset.datasets) == len(years):
+        year_lengths = [len(year_dataset) for year_dataset in dataset.datasets]
+    else:
+        # ERA5 forecasting datasets commonly expose 1459 usable samples per
+        # selected year (the final input has no next-step target), including
+        # leap years.  This mirrors train288.py: when the concatenated dataset
+        # is evenly divisible, use the actual datapipe length rather than the
+        # raw calendar length.
+        if len(dataset) % len(years) == 0:
+            samples_per_year = len(dataset) // len(years)
+            year_lengths = [samples_per_year] * len(years)
+        else:
+            raise ValueError(
+                "Cannot infer per-year boundaries for every-N-days sampling: "
+                f"dataset={len(dataset)}, years={len(years)}, "
+                "and no per-year child datasets are available"
+            )
+
+    indices = []
+    selected_days_by_year = {}
+    offset = 0
+    for year, year_length in zip(years, year_lengths):
+        calendar_days = 366 if calendar.isleap(year) else 365
+        complete_days = min(calendar_days, year_length // 4)
+        selected_day_offsets = list(range(0, complete_days, day_stride))
+        selected_days_by_year[year] = len(selected_day_offsets)
+
+        for day_offset in selected_day_offsets:
+            day_start = day_offset * 4
+            for time_slot in range(4):
+                local_index = day_start + time_slot
+                if local_index >= year_length:
+                    raise IndexError(
+                        "Every-N-days sample exceeds year dataset: "
+                        f"year={year}, local_index={local_index}, length={year_length}"
+                    )
+                indices.append(offset + local_index)
+        offset += year_length
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(indices)
+    return indices, selected_days_by_year
+
+
 def rebuild_dataloader_with_subset(dataloader, indices):
     subset = Subset(dataloader.dataset, indices)
     return torch.utils.data.DataLoader(
@@ -295,7 +367,39 @@ def main():
             str(getattr(cfg_data.dataset, "balanced_days_per_month", 0)),
         )
     )
-    if balanced_days_per_month > 0:
+    sample_every_n_days = int(
+        os.environ.get(
+            "SAMPLE_EVERY_N_DAYS",
+            str(getattr(cfg_data.dataset, "sample_every_n_days", 0)),
+        )
+    )
+    if sample_every_n_days > 0 and balanced_days_per_month > 0:
+        raise ValueError(
+            "SAMPLE_EVERY_N_DAYS and BALANCED_DAYS_PER_MONTH cannot both be enabled"
+        )
+
+    if sample_every_n_days > 0:
+        if train_sampler is not None:
+            raise RuntimeError("Every-N-days sampling currently requires single-device training")
+        sampled_indices, selected_days_by_year = build_every_n_days_indices(
+            train_dataloader.dataset,
+            cfg_data.dataset.train_ratio,
+            day_stride=sample_every_n_days,
+            seed=int(getattr(cfg_data.dataset, "random_seed", 42)),
+        )
+        train_dataloader = rebuild_dataloader_with_subset(
+            train_dataloader, sampled_indices
+        )
+        if world_rank == 0:
+            print(
+                "every-N-days training subset: "
+                f"years={list(cfg_data.dataset.train_ratio)}, "
+                f"stride={sample_every_n_days} day(s), four times/day, "
+                f"selected_days={selected_days_by_year}, "
+                f"samples={len(sampled_indices)}, shuffled with "
+                f"seed={int(getattr(cfg_data.dataset, 'random_seed', 42))}"
+            )
+    elif balanced_days_per_month > 0:
         if train_sampler is not None:
             raise RuntimeError("Balanced monthly sampling currently requires single-device training")
         balanced_indices = build_balanced_monthly_indices(
@@ -353,14 +457,32 @@ def main():
     ## Train process init
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     run_tag = os.environ.get("RUN_TAG", "").strip()
-    # 剪枝 warm start 时若未指定 RUN_TAG，自动生成以避免覆盖原始 checkpoint
-    if not run_tag and os.environ.get("PRUNE_FROM", "").strip():
+    adapt_from = os.environ.get("ADAPT_FROM", "").strip()
+    prune_from_env = os.environ.get("PRUNE_FROM", "").strip()
+    warm_start_from = os.environ.get("WARM_START_FROM", "").strip()
+    if adapt_from and prune_from_env:
+        raise ValueError("Set only one of ADAPT_FROM or PRUNE_FROM")
+    if warm_start_from and (adapt_from or prune_from_env):
+        raise ValueError("WARM_START_FROM cannot be combined with ADAPT_FROM/PRUNE_FROM")
+    transfer_from = adapt_from or prune_from_env
+    transfer_label = "ADAPT_FROM" if adapt_from else "PRUNE_FROM"
+    # ADAPT_FROM and WARM_START_FROM keep the legacy 2_10_10 filenames unless
+    # RUN_TAG is explicitly provided.  Structural pruning keeps its historical tag.
+    if not run_tag and prune_from_env:
         run_tag = "pruned2642"
         if world_rank == 0:
-            print(f"📌 PRUNE_FROM 已设置，自动生成 RUN_TAG={run_tag} 以保护原始 checkpoint")
+            print(
+                f"PRUNE_FROM is set; generated RUN_TAG={run_tag} "
+                "to protect the source checkpoint"
+            )
+    elif not run_tag and (adapt_from or warm_start_from):
+        if world_rank == 0:
+            print(
+                "legacy output filenames enabled: model_2_10_10_{bak,latest}.pth "
+                "and {trloss,valoss}_2_10_10.npy"
+            )
     if run_tag and not all(char.isalnum() or char in "-_" for char in run_tag):
         raise ValueError("RUN_TAG may contain only letters, digits, '-' and '_")
-    warm_start_from = os.environ.get("WARM_START_FROM", "").strip()
     artifact_suffix = f"_{run_tag}" if run_tag else ""
     train_loss_file = f"{cfg.checkpoint_dir}/trloss_2_10_10{artifact_suffix}.npy"
     valid_loss_file = f"{cfg.checkpoint_dir}/valoss_2_10_10{artifact_suffix}.npy"
@@ -392,12 +514,13 @@ def main():
     loss_definition_changed = False
     reset_optimizer = os.environ.get("RESET_OPTIMIZER", "0") != "0"
     override_resume_lr = os.environ.get("OVERRIDE_RESUME_LR", "0") != "0"
-    backbone_lr = float(os.environ.get("BACKBONE_LR", "5e-5"))
-    interface_lr = float(os.environ.get("INTERFACE_LR", "2e-4"))
+    # Conservative defaults for adapting an already-trained model to a new patch size.
+    backbone_lr = float(os.environ.get("BACKBONE_LR", "2e-6"))
+    interface_lr = float(os.environ.get("INTERFACE_LR", "1e-5"))
     kd_enabled = os.environ.get("KD_ENABLED", "0") != "0"
     kd_interface_only = os.environ.get("KD_INTERFACE_ONLY", "1") != "0"
-    kd_alpha_start = float(os.environ.get("KD_ALPHA", "0.2"))
-    kd_alpha_end = float(os.environ.get("KD_ALPHA_MIN", "0.02"))
+    kd_alpha_start = float(os.environ.get("KD_ALPHA", "0.05"))
+    kd_alpha_end = float(os.environ.get("KD_ALPHA_MIN", "0.01"))
     patch_embed_init = os.environ.get("PATCH_EMBED_INIT", "1") != "0"
     reset_interface = os.environ.get("RESET_INTERFACE", "0") != "0"
     freeze_backbone_epochs = int(os.environ.get("FREEZE_BACKBONE_EPOCHS", "0"))
@@ -405,21 +528,20 @@ def main():
 
     if reset_interface:
         reset_optimizer = True
-    if kd_enabled and kd_interface_only and freeze_backbone_epochs <= 0:
-        raise ValueError(
-            "KD_INTERFACE_ONLY=1 requires FREEZE_BACKBONE_EPOCHS > 0"
-        )
 
-    prune_from = os.environ.get("PRUNE_FROM", "").strip()
-    # ---- Auto-resume: PRUNE_FROM 已设置但已有同 RUN_TAG 的 checkpoint 时，自动续训 ----
-    force_reprune = os.environ.get("FORCE_REPRUNE", "0") != "0"
-    if prune_from and not force_reprune and (os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path)):
+    prune_from = transfer_from
+    # Auto-resume an existing transfer run unless explicitly restarted.
+    force_retransfer = (
+        os.environ.get("FORCE_RETRANSFER", "0") != "0"
+        or os.environ.get("FORCE_REPRUNE", "0") != "0"
+    )
+    if prune_from and not force_retransfer and (os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path)):
         if world_rank == 0:
             print("\n" + "-" * 50)
-            print(f"📌 PRUNE_FROM 已设置，但发现已有剪枝 checkpoint: {latest_ckpt_path}")
-            print(f"   自动切换为续训模式（如需重新剪枝请设置 FORCE_REPRUNE=1 或删除该 checkpoint）")
+            print(f"existing transfer checkpoint found: {latest_ckpt_path}")
+            print("switching to resume mode; use FORCE_RETRANSFER=1 to restart")
             print("-" * 50 + "\n")
-        prune_from = ""  # 清空以落入续训分支
+        prune_from = ""
     # ---- New data curriculum: inherit model weights only and start fresh progress. ----
     if warm_start_from:
         if not os.path.exists(warm_start_from):
@@ -445,14 +567,28 @@ def main():
     # ---- Step 0 (剪枝 warm start): 从全量 checkpoint 做结构剪枝的权重迁移 ----
     elif prune_from:
         if not os.path.exists(prune_from):
-            raise FileNotFoundError(f"PRUNE_FROM checkpoint not found: {prune_from}")
+            raise FileNotFoundError(f"{transfer_label} checkpoint not found: {prune_from}")
         if world_rank == 0:
             print("\n")
             print("-" * 50)
-            print(f"✂️  剪枝 warm start: 从 {prune_from} 加载权重到 depth={cfg.depth} 模型")
+            print(
+                f"model transfer: loading {prune_from} into "
+                f"patch_size={list(cfg.patch_size)}, depth={list(cfg.depth)}"
+            )
             print("-" * 50 + "\n")
         ckpt = torch.load(prune_from, map_location="cpu", weights_only=False)
         src_state = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+
+        source_depth = ckpt.get("depth") if isinstance(ckpt, dict) else None
+        if adapt_from and source_depth is not None:
+            source_depth = tuple(int(value) for value in source_depth)
+            target_depth = tuple(int(value) for value in cfg.depth)
+            if source_depth != target_depth:
+                raise RuntimeError(
+                    "ADAPT_FROM changes patch size only and requires matching depth: "
+                    f"source={source_depth}, target={target_depth}. "
+                    "Use PRUNE_FROM only when structural pruning is intentional."
+                )
 
         model_state = model.state_dict()
         filtered_state = {}
@@ -467,8 +603,21 @@ def main():
         missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
         real_missing = [k for k in missing_keys if "attn_mask" not in k]
         attn_mask_missing = [k for k in missing_keys if "attn_mask" in k]
+        structural_missing = [k for k in real_missing if k not in skipped_keys]
 
         pruned_count = len(src_state) - len(filtered_state) - len(skipped_keys)
+        if adapt_from and pruned_count > 0:
+            raise RuntimeError(
+                "ADAPT_FROM detected parameters absent from the target model "
+                f"({pruned_count} keys). Keep source/target depth identical, or use "
+                "PRUNE_FROM when pruning is intentional."
+            )
+        if adapt_from and structural_missing:
+            raise RuntimeError(
+                "ADAPT_FROM found target parameters absent from the source checkpoint: "
+                f"{structural_missing[:20]}. This usually means source/target depth "
+                "does not match. ADAPT_FROM must not randomly initialize Transformer blocks."
+            )
         if world_rank == 0:
             print(f"✅ 已迁移 {len(filtered_state)} 个参数")
             print(f"✂️  跳过 {pruned_count} 个被剪枝的参数（layer3.block4/block5 不存在于新模型）")
@@ -503,11 +652,11 @@ def main():
                 log_fn=print if world_rank == 0 else lambda *args: None,
             )
 
-        # 剪枝微调建议使用较小学习率
+        # Patch adaptation / pruning should start from conservative learning rates.
         if "BACKBONE_LR" not in os.environ:
-            backbone_lr = 2e-5
+            backbone_lr = 2e-6
         if "INTERFACE_LR" not in os.environ:
-            interface_lr = 1e-4
+            interface_lr = 1e-5
 
     # ---- Step 1: 断点续训（优先）：2_10_10 checkpoint = 继承全量模型训练后的结果 ----
     elif os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path):
@@ -665,20 +814,49 @@ def main():
     optimizer = build_optimizer(model, backbone_lr=backbone_lr, interface_lr=interface_lr)
     scheduler = build_scheduler(optimizer, t_max=cfg.max_epoch)
 
-    freeze_until_epoch = start_epoch + max(0, freeze_backbone_epochs)
-    if kd_enabled:
-        teacher_ckpt = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
-        if not os.path.exists(teacher_ckpt):
-            raise FileNotFoundError(f"KD_ENABLED=1 requires official checkpoint: {teacher_ckpt}")
-        teacher_depth = tuple(
-            int(value) for value in os.environ.get("TEACHER_DEPTH", "2,6,6,2").split(",")
+    # Freeze is an experiment-level phase, not a per-process phase.  Restarts must
+    # not append another FREEZE_BACKBONE_EPOCHS epochs to the warm-up.
+    if resume_ckpt_data is not None:
+        freeze_until_epoch = int(
+            resume_ckpt_data.get(
+                "freeze_until_epoch", max(0, freeze_backbone_epochs)
+            )
         )
+    else:
+        freeze_until_epoch = max(0, freeze_backbone_epochs)
+
+    teacher_ckpt = os.environ.get(
+        "TEACHER_CKPT", os.path.join(cfg.checkpoint_dir, "model_bak.pth")
+    ).strip()
+    teacher_patch_size = parse_int_tuple(
+        os.environ.get("TEACHER_PATCH_SIZE", "2,4,4"),
+        "TEACHER_PATCH_SIZE",
+        3,
+    )
+    teacher_depth = parse_int_tuple(
+        os.environ.get("TEACHER_DEPTH", "2,6,6,2"),
+        "TEACHER_DEPTH",
+        4,
+    )
+    kd_will_be_active = kd_enabled and (
+        not kd_interface_only or start_epoch < freeze_until_epoch
+    )
+    if kd_enabled and kd_interface_only and freeze_until_epoch <= 0:
+        raise ValueError(
+            "KD_INTERFACE_ONLY=1 requires FREEZE_BACKBONE_EPOCHS > 0 "
+            "for a new experiment"
+        )
+    if kd_will_be_active:
+        if not os.path.exists(teacher_ckpt):
+            raise FileNotFoundError(
+                f"KD_ENABLED=1 requires teacher checkpoint: {teacher_ckpt}"
+            )
         teacher_model = load_teacher_model(
             teacher_ckpt,
             img_size=cfg_data.dataset.img_size,
             device=local_rank,
             depth=teacher_depth,
-            patch_size=(2, 4, 4),
+            patch_size=teacher_patch_size,
             embed_dim=cfg.embed_dim,
             num_heads=cfg.num_heads,
             window_size=cfg.window_size,
@@ -688,15 +866,34 @@ def main():
         if world_rank == 0:
             print(
                 f"distillation enabled: alpha {kd_alpha_start} -> {kd_alpha_end}, "
-                "teacher patch_size=[2,4,4], scored fields only, "
+                f"teacher={teacher_ckpt}, patch_size={list(teacher_patch_size)}, "
+                f"depth={list(teacher_depth)}, scored fields only, "
                 f"interface_only={kd_interface_only}"
             )
 
-    if world_rank == 0 and freeze_backbone_epochs > 0:
+    if world_rank == 0 and freeze_until_epoch > start_epoch:
         print(
-            f"backbone warm-up freeze: epochs [{start_epoch}, {freeze_until_epoch}) "
-            f"({freeze_backbone_epochs} epoch(s))"
+            f"backbone warm-up freeze: epochs [0, {freeze_until_epoch}); "
+            f"current start_epoch={start_epoch}"
         )
+
+    checkpoint_metadata = {
+        "patch_size": list(cfg.patch_size),
+        "depth": list(cfg.depth),
+        "train_years": [int(year) for year in cfg_data.dataset.train_ratio],
+        "validation_years": [int(year) for year in cfg_data.dataset.val_ratio],
+        "sample_every_n_days": sample_every_n_days,
+        "sampling_seed": int(getattr(cfg_data.dataset, "random_seed", 42)),
+        "freeze_until_epoch": freeze_until_epoch,
+        "source_checkpoint": warm_start_from or transfer_from or None,
+        "transfer_mode": (
+            "adapt" if adapt_from else "prune" if prune_from_env else "warm_start"
+            if warm_start_from else None
+        ),
+        "teacher_checkpoint": teacher_ckpt if kd_will_be_active else None,
+        "teacher_patch_size": list(teacher_patch_size) if kd_will_be_active else None,
+        "teacher_depth": list(teacher_depth) if kd_will_be_active else None,
+    }
 
     ## Only restore optimizer/scheduler when explicitly requested.
     if resume_ckpt_data is not None and not reset_optimizer:
@@ -796,10 +993,11 @@ def main():
             current_offset = 0
 
         # train_max_batches / train_skip_stride 始终基于全量 DataLoader 计算
-        train_max_batches = int(os.environ.get("TRAIN_MAX_BATCHES", "2940"))
+        # 0 means use the complete training set, matching the stable 288 workflow.
+        train_max_batches = int(os.environ.get("TRAIN_MAX_BATCHES", "0"))
         if epoch < freeze_until_epoch:
             train_max_batches = int(
-                os.environ.get("WARMUP_MAX_BATCHES", str(train_max_batches))
+                os.environ.get("WARMUP_MAX_BATCHES", "100")
             )
         full_train_total = len(original_train_dataloader)
         if train_max_batches > 0 and train_max_batches < full_train_total:
@@ -906,6 +1104,7 @@ def main():
                         model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
                         cfg.checkpoint_dir, latest_ckpt_name,
                         epoch=epoch, next_batch_idx=current_offset + j + 1, epoch_complete=False,
+                        metadata=checkpoint_metadata,
                     )
                     logger.info(f"interval checkpoint saved at epoch={epoch}, next_batch={current_offset + j + 1}")
                     last_interval_save = time.time()
@@ -923,7 +1122,8 @@ def main():
         valid_aux = 0
         valid_field_mse = np.zeros(len(target_channel_indices), dtype=np.float64)
         valid_field_acc = np.zeros(len(target_channel_indices), dtype=np.float64)
-        val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", "500"))
+        # 0 evaluates the complete validation year; set VAL_MAX_SAMPLES to cap it.
+        val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", "0"))
         if "VAL_MAX_BATCHES" in os.environ and "VAL_MAX_SAMPLES" not in os.environ:
             val_max_samples = int(os.environ["VAL_MAX_BATCHES"]) * cfg_data.dataloader.batch_size
         val_dataset = val_dataloader.dataset
@@ -1014,6 +1214,7 @@ def main():
                     model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
                     cfg.checkpoint_dir, best_ckpt_name,
                     epoch=epoch, next_batch_idx=0, epoch_complete=True,
+                    metadata=checkpoint_metadata,
                 )
             is_save_ckp = True
 
@@ -1024,6 +1225,7 @@ def main():
                 model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
                 cfg.checkpoint_dir, latest_ckpt_name,
                 epoch=epoch, next_batch_idx=0, epoch_complete=True,
+                metadata=checkpoint_metadata,
             )
 
         if world_rank == 0:
@@ -1044,7 +1246,19 @@ def main():
             exit()
 
 
-def save_checkpoint(model, optimizer, scheduler, best_valid_loss, best_loss_epoch, model_path, filename, epoch=None, next_batch_idx=0, epoch_complete=True):
+def save_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    best_valid_loss,
+    best_loss_epoch,
+    model_path,
+    filename,
+    epoch=None,
+    next_batch_idx=0,
+    epoch_complete=True,
+    metadata=None,
+):
     model_to_save = model.module if hasattr(model, "module") else model
     state = {
         "model_state_dict": model_to_save.state_dict(),
@@ -1057,6 +1271,8 @@ def save_checkpoint(model, optimizer, scheduler, best_valid_loss, best_loss_epoc
         "epoch_complete": epoch_complete,
         "loss_version": LOSS_VERSION,
     }
+    if metadata:
+        state.update(metadata)
     os.makedirs(model_path, exist_ok=True)
     tmp_path = os.path.join(model_path, filename + ".tmp")
     dst_path = os.path.join(model_path, filename)

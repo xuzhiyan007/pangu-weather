@@ -1,4 +1,4 @@
-"""Convert the [2, 6, 4, 2] pruned checkpoint with convert1's INT8 scheme."""
+"""Convert a Pangu training checkpoint to the INT8 inference format."""
 
 import argparse
 import os
@@ -8,6 +8,20 @@ import torch
 
 POSITION_BIAS_NAME = "earth_position_bias_table"
 ATTN_MASK_NAME = "attn_mask"
+DEFAULT_MODEL_DEPTH = (2, 6, 6, 2)
+DEFAULT_PATCH_SIZE = (2, 10, 10)
+
+
+def parse_int_tuple(value, name, expected_length):
+    try:
+        parsed = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be comma-separated integers: {value!r}") from exc
+    if len(parsed) != expected_length:
+        raise ValueError(
+            f"{name} must contain {expected_length} integers, got {parsed}"
+        )
+    return parsed
 
 
 def mb(path):
@@ -102,9 +116,15 @@ def convert_checkpoint(
     dtype,
     position_bias_dtype="int8",
     linear_group_size=0,
+    fallback_depth=DEFAULT_MODEL_DEPTH,
+    fallback_patch_size=DEFAULT_PATCH_SIZE,
 ):
     checkpoint = torch.load(src_path, map_location="cpu", weights_only=False)
     source_state = checkpoint.get("model_state_dict", checkpoint)
+    model_depth = tuple(int(value) for value in checkpoint.get("depth", fallback_depth))
+    patch_size = tuple(
+        int(value) for value in checkpoint.get("patch_size", fallback_patch_size)
+    )
 
     model_state = {}
     position_bias_int8 = {}
@@ -194,7 +214,8 @@ def convert_checkpoint(
             "dropped_duplicate_fuser_tensors": (
                 "Fuser duplicates fuser when tensor values are equal"
             ),
-            "model_depth": [2, 6, 4, 2],
+            "model_depth": list(model_depth),
+            "model_patch_size": list(patch_size),
         },
     }
     target_dir = os.path.dirname(dst_path)
@@ -203,27 +224,38 @@ def convert_checkpoint(
     temporary_path = dst_path + ".tmp"
     torch.save(output, temporary_path)
     os.replace(temporary_path, dst_path)
+    stats["model_depth"] = list(model_depth)
+    stats["model_patch_size"] = list(patch_size)
     return stats
 
 
 DEFAULT_SOURCE = os.path.join(
-    "data", "checkpoints", "model_2_10_10_pruned2642_latest.pth"
+    "data", "checkpoints", "model_2_10_10_latest.pth"
 )
 DEFAULT_TARGET = os.path.join(
-    "data", "checkpoints", "model_2_10_10_pruned2642_light_int8_bf16.pth"
+    "data", "checkpoints", "model_2_10_10_light_int8_bf16.pth"
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Apply convert1's all-2D-weight INT8 storage format to the "
-            "depth=[2,6,4,2] pruned model."
+            "Apply the all-2D-weight INT8 storage format to a Pangu checkpoint."
         )
     )
     parser.add_argument("--src", default=DEFAULT_SOURCE)
     parser.add_argument("--dst", default=DEFAULT_TARGET)
     parser.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
+    parser.add_argument(
+        "--model-depth",
+        default=",".join(str(value) for value in DEFAULT_MODEL_DEPTH),
+        help="Fallback depth for old checkpoints without metadata.",
+    )
+    parser.add_argument(
+        "--patch-size",
+        default=",".join(str(value) for value in DEFAULT_PATCH_SIZE),
+        help="Fallback patch size for old checkpoints without metadata.",
+    )
     parser.add_argument(
         "--position-bias-dtype",
         choices=["int8", "normal"],
@@ -246,9 +278,12 @@ def main():
         raise FileNotFoundError(f"Cannot find source checkpoint: {args.src}")
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
-    print(f"source pruned checkpoint: {args.src}")
+    fallback_depth = parse_int_tuple(args.model_depth, "--model-depth", 4)
+    fallback_patch_size = parse_int_tuple(args.patch_size, "--patch-size", 3)
+    print(f"source checkpoint: {args.src}")
     print(f"target light checkpoint: {args.dst}")
-    print("expected model depth: [2, 6, 4, 2]")
+    print(f"fallback model depth: {list(fallback_depth)}")
+    print(f"fallback patch size: {list(fallback_patch_size)}")
     print(f"normal tensor dtype: {args.dtype}")
     print(f"{POSITION_BIAS_NAME}: {args.position_bias_dtype}")
     if args.linear_group_size > 0:
@@ -266,6 +301,8 @@ def main():
         dtype,
         position_bias_dtype=args.position_bias_dtype,
         linear_group_size=args.linear_group_size,
+        fallback_depth=fallback_depth,
+        fallback_patch_size=fallback_patch_size,
     )
 
     src_mb = mb(args.src)
@@ -279,7 +316,7 @@ def main():
     print(f"  compression: {src_mb / dst_mb:.2f}x")
     print(f"  saved: {(1.0 - dst_mb / src_mb) * 100:.1f}%")
     print("\nrun:")
-    print(f"  LIGHT_CKPT={args.dst} python inference1.py")
+    print(f"  LIGHT_CKPT={args.dst} python inference.py")
 
 
 if __name__ == "__main__":

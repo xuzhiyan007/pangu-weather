@@ -1,4 +1,4 @@
-"""Standalone inference for the depth=[2, 6, 4, 2] INT8 Pangu model."""
+"""Standalone inference for an INT8 Pangu model."""
 
 import json
 import os
@@ -15,9 +15,10 @@ from pangu_patchsize import PanguPatchSize as Pangu
 
 
 POSITION_BIAS_NAME = "earth_position_bias_table"
-EXPECTED_DEPTH = (2, 6, 4, 2)
+DEFAULT_MODEL_DEPTH = (2, 6, 6, 2)
+DEFAULT_PATCH_SIZE = (2, 10, 10)
 DEFAULT_CHECKPOINT = os.path.join(
-    "data", "checkpoints", "model_2_10_10_pruned2642_light_int8_bf16.pth"
+    "data", "checkpoints", "model_2_10_10_light_int8_bf16.pth"
 )
 
 
@@ -82,15 +83,17 @@ def restore_fuser_aliases(state_dict):
     state_dict.update(additions)
 
 
-def unpack_pruned_checkpoint(checkpoint, infer_dtype):
+def unpack_checkpoint(checkpoint, infer_dtype):
     light_format = checkpoint.get("light_format", {})
-    checkpoint_depth = tuple(light_format.get("model_depth", EXPECTED_DEPTH))
-    if checkpoint_depth != EXPECTED_DEPTH:
-        raise ValueError(
-            f"Checkpoint depth is {checkpoint_depth}, expected {EXPECTED_DEPTH}"
-        )
+    checkpoint_depth = tuple(
+        int(value) for value in light_format.get("model_depth", DEFAULT_MODEL_DEPTH)
+    )
+    checkpoint_patch_size = tuple(
+        int(value)
+        for value in light_format.get("model_patch_size", DEFAULT_PATCH_SIZE)
+    )
     if light_format.get("int4_scope") not in (None, "none"):
-        raise ValueError("inference2642.py does not accept INT4 checkpoints")
+        raise ValueError("inference.py does not accept INT4 checkpoints")
 
     state_dict = dict(checkpoint.get("model_state_dict", checkpoint))
     group_size = int(light_format.get("mlp_group_size", 0))
@@ -120,7 +123,7 @@ def unpack_pruned_checkpoint(checkpoint, infer_dtype):
             "Quantized tensors have no supported scale: " + ", ".join(unresolved[:10])
         )
     restore_fuser_aliases(state_dict)
-    return state_dict, light_format
+    return state_dict, light_format, checkpoint_depth, checkpoint_patch_size
 
 
 def load_static_surface_mask(cfg_data, device, dtype):
@@ -148,18 +151,11 @@ def main():
     cfg = YParams(config_path, "model")
     cfg_data = YParams(config_path, "datapipe")
 
-    config_depth = tuple(int(value) for value in cfg.depth)
-    if config_depth != EXPECTED_DEPTH:
-        raise ValueError(
-            f"conf/config.yaml model.depth is {config_depth}; "
-            f"set it to {EXPECTED_DEPTH} for the pruned checkpoint"
-        )
-
     checkpoint_path = os.environ.get("LIGHT_CKPT", DEFAULT_CHECKPOINT)
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
-            f"Cannot find pruned light checkpoint: {checkpoint_path}. "
-            "Run python convert2642.py first."
+            f"Cannot find light checkpoint: {checkpoint_path}. "
+            "Run python convert.py first."
         )
 
     device = torch.device("cuda:0")
@@ -170,20 +166,37 @@ def main():
     surface_mask = load_static_surface_mask(cfg_data, device, infer_dtype)
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    model_state, light_format = unpack_pruned_checkpoint(checkpoint, infer_dtype)
+    (
+        model_state,
+        light_format,
+        checkpoint_depth,
+        checkpoint_patch_size,
+    ) = unpack_checkpoint(checkpoint, infer_dtype)
+    config_depth = tuple(int(value) for value in cfg.depth)
+    config_patch_size = tuple(int(value) for value in cfg.patch_size)
+    if config_depth != checkpoint_depth:
+        raise ValueError(
+            f"conf/config.yaml model.depth is {config_depth}, but checkpoint "
+            f"depth is {checkpoint_depth}"
+        )
+    if config_patch_size != checkpoint_patch_size:
+        raise ValueError(
+            f"conf/config.yaml model.patch_size is {config_patch_size}, but "
+            f"checkpoint patch size is {checkpoint_patch_size}"
+        )
     model = Pangu(
         img_size=cfg_data.dataset.img_size,
-        patch_size=cfg.patch_size,
+        patch_size=checkpoint_patch_size,
         embed_dim=cfg.embed_dim,
         num_heads=cfg.num_heads,
         window_size=cfg.window_size,
-        depth=EXPECTED_DEPTH,
+        depth=checkpoint_depth,
     ).to(device=device, dtype=infer_dtype)
     missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
     bad_missing = [key for key in missing_keys if "attn_mask" not in key]
     if bad_missing or unexpected_keys:
         raise RuntimeError(
-            "Checkpoint does not match the pruned model. "
+            "Checkpoint does not match the configured model. "
             f"missing={bad_missing[:20]}, unexpected={unexpected_keys[:20]}"
         )
     model.eval()
@@ -191,7 +204,8 @@ def main():
     output_dir = os.path.join("result", "output")
     os.makedirs(output_dir, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
-    print(f"model depth: {list(EXPECTED_DEPTH)}")
+    print(f"model depth: {list(checkpoint_depth)}")
+    print(f"patch size: {list(checkpoint_patch_size)}")
     print(f"infer dtype: {infer_dtype}")
     print(f"int8 storage scope: {light_format.get('int8_scope', 'unknown')}")
     if missing_keys:
