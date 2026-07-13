@@ -2,3 +2,5 @@
 *.pyc
 *.pth
 *profile/
+*analysis/
+*time_profile2/

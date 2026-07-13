@@ -15,7 +15,8 @@ from torch.utils.data import Subset
 from torch.cuda.amp import autocast
 from distill_utils import (
     get_kd_alpha,
-    init_patch_embed_from_official,
+    init_bias_table_from_source,
+    init_patch_embed_from_source,
     load_teacher_model,
     reset_interface_from_official,
     setup_staged_freezing,
@@ -245,8 +246,8 @@ def main():
     if run_tag and not all(char.isalnum() or char in "-_" for char in run_tag):
         raise ValueError("RUN_TAG may contain only letters, digits, '-' and '_'")
     artifact_suffix = f"_{run_tag}" if run_tag else ""
-    train_loss_file = f"{cfg.checkpoint_dir}/trloss_288{artifact_suffix}.npy"
-    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_288{artifact_suffix}.npy"
+    train_loss_file = f"{cfg.checkpoint_dir}/trloss_299{artifact_suffix}.npy"
+    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_299{artifact_suffix}.npy"
     best_valid_loss = 1.0e6
     best_loss_epoch = 0
     train_losses = np.empty((0,), dtype=np.float32)
@@ -261,8 +262,8 @@ def main():
         print("-" * 50, "\n")
 
     ## Checkpoint file names
-    best_ckpt_name = f"model_288{artifact_suffix}_bak.pth"
-    latest_ckpt_name = f"model_288{artifact_suffix}_latest.pth"
+    best_ckpt_name = f"model_299{artifact_suffix}_bak.pth"
+    latest_ckpt_name = f"model_299{artifact_suffix}_latest.pth"
     best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
     save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "600"))
@@ -332,13 +333,36 @@ def main():
 
         start_epoch = 0
         start_batch = 0
+
+        # patch_size 变更时，用插值初始化不匹配的 patch_embed/recovery conv 权重
+        if patch_embed_init and skipped_keys:
+            if world_rank == 0:
+                print("initializing mismatched patch projections from PRUNE_FROM source")
+            init_patch_embed_from_source(
+                model,
+                prune_from,
+                device="cpu",
+                log_fn=print if world_rank == 0 else lambda *args: None,
+            )
+
+        # earth_position_bias_table 窗口维度插值初始化
+        if patch_embed_init:
+            if world_rank == 0:
+                print("initializing earth_position_bias_table from PRUNE_FROM source")
+            init_bias_table_from_source(
+                model,
+                prune_from,
+                device="cpu",
+                log_fn=print if world_rank == 0 else lambda *args: None,
+            )
+
         # 剪枝微调建议使用较小学习率
         if "BACKBONE_LR" not in os.environ:
             backbone_lr = 2e-5
         if "INTERFACE_LR" not in os.environ:
             interface_lr = 1e-4
 
-    # ---- Step 1: 断点续训（优先）：288 checkpoint = 继承全量模型训练后的结果 ----
+    # ---- Step 1: 断点续训（优先）：299 checkpoint = 继承全量模型训练后的结果 ----
     elif os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path):
         resume_ckpt = latest_ckpt_path if os.path.exists(latest_ckpt_path) else best_ckpt_path
         if world_rank == 0:
@@ -415,7 +439,7 @@ def main():
             if reset_optimizer:
                 print("new loss/lr mode: loaded model weights and progress; optimizer/scheduler/best loss reset")
 
-    # ---- Step 1 (备): warm start：无 288 checkpoint 时，从 244 全量权重部分迁移 ----
+    # ---- Step 1 (备): warm start：无 299 checkpoint 时，从 244 全量权重部分迁移 ----
     elif os.path.exists(os.path.join(cfg.checkpoint_dir, "model_bak.pth")):
         warm_start_path = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
         if world_rank == 0:
@@ -457,8 +481,8 @@ def main():
 
         if patch_embed_init:
             if world_rank == 0:
-                print("initializing mismatched patch projections: [2,4,4] -> [2,8,8]")
-            initialized_count = init_patch_embed_from_official(
+                print("initializing mismatched patch projections: source -> target patch_size")
+            initialized_count = init_patch_embed_from_source(
                 model,
                 warm_start_path,
                 device="cpu",
@@ -468,8 +492,18 @@ def main():
                 print(f"initialized {initialized_count} patch projection weights")
             if initialized_count == 0:
                 raise RuntimeError(
-                    "PATCH_EMBED_INIT=1 did not find compatible 4x4 -> 8x8 projection weights"
+                    "PATCH_EMBED_INIT=1 did not find compatible projection weights to initialize"
                 )
+
+            # earth_position_bias_table 窗口维度插值初始化
+            if world_rank == 0:
+                print("initializing earth_position_bias_table from source")
+            init_bias_table_from_source(
+                model,
+                warm_start_path,
+                device="cpu",
+                log_fn=print if world_rank == 0 else lambda *args: None,
+            )
 
     if world_rank == 0:
         total = sum(p.numel() for p in model.parameters())

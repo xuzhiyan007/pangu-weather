@@ -170,8 +170,8 @@ if __name__ == "__main__":
     cfg = YParams(config_file_path, 'model')
     cfg_data = YParams(config_file_path, "datapipe")
 
-    train_loss = np.load('./data/checkpoints/trloss_288.npy')
-    valid_loss = np.load('./data/checkpoints/valoss_288.npy')
+    train_loss = np.load('./data/checkpoints/trloss_299.npy')
+    valid_loss = np.load('./data/checkpoints/valoss_299.npy')
     plot_loss(train_loss, valid_loss)
 
     data_dir = cfg_data.dataset.data_dir

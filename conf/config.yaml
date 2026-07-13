@@ -1,7 +1,7 @@
 model:
     start_epoch: 0
     max_epoch: 5            
-    patch_size: [2, 8, 8]
+    patch_size: [2, 9, 9]
     embed_dim: 192
     num_heads: [6, 12, 12, 6]
     window_size: [2, 6, 12]
@@ -9,13 +9,13 @@ model:
     # depth 控制各 Transformer layer 的 block 数量（原版 [2, 6, 6, 2]）
     # 方案B: layer3_depth=4（剪掉 block4/5，保留 block0/1/2/3）→ depth: [2, 6, 4, 2]
     # 消融实验显示 block4/5 偏差最低（0.080/0.096），是 layer3 中最安全的剪枝目标
-    # 训练命令: PRUNE_FROM=data/checkpoints/model_288_latest.pth python train.py
+    # 训练命令: PRUNE_FROM=data/checkpoints/model_299_latest.pth python train.py
     depth: [2, 6, 4, 2]
     patience: 50
     checkpoint_dir: "./data/checkpoints"         # AI4S，路径不可更改
 
 student_model:
-    patch_size: [2, 8, 8]
+    patch_size: [2, 9, 9]
     embed_dim: 128
     num_heads: [4, 8, 8, 4]
     window_size: [2, 6, 12]
