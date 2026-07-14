@@ -1,6 +1,8 @@
 import torch
+import torch.nn.functional as F
 import os
 import sys
+import json
 import numpy as np
 import torch.distributed as dist
 import logging
@@ -51,13 +53,26 @@ TARGET_LOSS_CHANNELS = {
     "v_component_of_wind_500",
 }
 LATITUDE_WEIGHTED_LOSS = os.environ.get("LATITUDE_WEIGHTED_LOSS", "1") != "0"
+# ---- W-score alignment feature switches (方案A/B/C) ----
+# 方案A: 主项 MSE -> RMSE；方案B: 逐通道自适应权重；方案C: W-score 代理损失。
+# 全部默认关闭以保持向后兼容；开启 A/B 会改变 GT loss 语义，故并入 LOSS_VERSION 以触发优化器重置。
+USE_RMSE_LOSS = os.environ.get("USE_RMSE_LOSS", "0") != "0"
+W_SCORE_CHANNEL_WEIGHT = os.environ.get("W_SCORE_CHANNEL_WEIGHT", "0") != "0"
+W_PROXY_WEIGHT = float(os.environ.get("W_PROXY_WEIGHT", "0.0"))
 LOSS_VERSION = (
     "score_aligned_mse_acc_v1_latitude"
     if LATITUDE_WEIGHTED_LOSS
     else "score_aligned_mse_acc_v1_gridpoint"
 )
+_wscore_tags = []
+if USE_RMSE_LOSS:
+    _wscore_tags.append("rmse")
+if W_SCORE_CHANNEL_WEIGHT:
+    _wscore_tags.append("chw")
+if _wscore_tags:
+    LOSS_VERSION = LOSS_VERSION + "__" + "_".join(_wscore_tags)
 COMPATIBLE_LOSS_VERSIONS = {LOSS_VERSION}
-if LATITUDE_WEIGHTED_LOSS:
+if LATITUDE_WEIGHTED_LOSS and not _wscore_tags:
     COMPATIBLE_LOSS_VERSIONS.add("score_aligned_mse_acc_v1")
 
 
@@ -80,24 +95,21 @@ def build_latitude_weights(height, device, latitude_weighted=True):
     return weights.view(1, 1, height, 1)
 
 
-def score_aligned_loss(
-    prediction,
-    target,
-    target_indices,
-    latitude_weights,
-    mse_weight=0.8,
-    acc_weight=0.2,
-    auxiliary_weight=0.05,
-    eps=1e-6,
-):
-    """Equal-channel loss for the 15 scored fields plus a weak auxiliary loss."""
-    scored_prediction = prediction.index_select(1, target_indices).float()
-    scored_target = target.index_select(1, target_indices).float()
+def compute_scored_field_metrics(scored_prediction, scored_target, latitude_weights, eps=1e-6):
+    """Per-sample, per-field cos(lat)-weighted MSE / RMSE / ACC proxy.
 
-    spatial_weight_sum = latitude_weights.sum() * prediction.shape[-1]
+    Shared by the training loss and precompute_teacher_metrics.py so that the teacher
+    reference metrics live in EXACTLY the same (normalized) space and use the same
+    spatial-mean-removed ACC proxy as the training objective; this makes the
+    student/teacher ratios in the W-score aligned terms directly comparable.
+
+    scored_prediction / scored_target: [B, K, H, W] (already channel-selected, float).
+    Returns per_field_mse [B, K], per_field_rmse [B, K], correlation [B, K].
+    """
+    spatial_weight_sum = latitude_weights.sum() * scored_prediction.shape[-1]
     squared_error = (scored_prediction - scored_target).square()
     per_field_mse = (squared_error * latitude_weights).sum(dim=(-2, -1)) / spatial_weight_sum
-    scored_mse = per_field_mse.mean()
+    per_field_rmse = torch.sqrt(per_field_mse + eps)
 
     pred_mean = (scored_prediction * latitude_weights).sum(dim=(-2, -1), keepdim=True) / spatial_weight_sum
     target_mean = (scored_target * latitude_weights).sum(dim=(-2, -1), keepdim=True) / spatial_weight_sum
@@ -108,20 +120,75 @@ def score_aligned_loss(
     target_variance = (target_anomaly.square() * latitude_weights).sum(dim=(-2, -1))
     correlation = covariance / torch.sqrt(pred_variance * target_variance + eps)
     correlation = correlation.clamp(-1.0, 1.0)
+    return per_field_mse, per_field_rmse, correlation
+
+
+def build_w_score_channel_weights(per_field_rmse, teacher_rmse, temperature=2.0, eps=1e-6):
+    """方案B: 依据 student/teacher 的 per-field RMSE 比值生成逐通道权重。
+
+    - student RMSE << teacher (已领先): 高权重, 继续改善 W-score 收益大;
+    - student RMSE ≈ teacher (边界):   中权重, 最关键的突破点;
+    - student RMSE >> teacher (落后):   低权重(但不为零), 避免梯度浪费在 max{.,1} 截断区。
+
+    权重归一化到均值 1, 保持整体 loss 量纲不变; detach 后不参与梯度回传。
+    """
+    rmse_ratio = teacher_rmse.view(1, -1) / (per_field_rmse + eps)  # [B, K], >1 = winning
+    weights = torch.sigmoid(temperature * (rmse_ratio - 1.0))
+    weights = weights / (weights.mean() + eps)
+    return weights.detach()
+
+
+def score_aligned_loss(
+    prediction,
+    target,
+    target_indices,
+    latitude_weights,
+    mse_weight=0.8,
+    acc_weight=0.2,
+    auxiliary_weight=0.05,
+    eps=1e-6,
+    use_rmse=False,
+    teacher_rmse=None,
+    channel_weight_temp=2.0,
+):
+    """Equal-channel loss for the 15 scored fields plus a weak auxiliary loss.
+
+    方案A (use_rmse=True): 主项由 MSE 改为 RMSE, 梯度 ∝ error/RMSE, 让误差已很小的
+        通道仍获得足够推力, 更贴合 W-score 对 RMSE 比值的二次奖励方向。
+    方案B (teacher_rmse!=None): 主项按逐通道 W-score 贡献潜力自适应加权, 把优化力度
+        集中到"接近或已超越原模型"的通道上。
+    """
+    scored_prediction = prediction.index_select(1, target_indices).float()
+    scored_target = target.index_select(1, target_indices).float()
+
+    per_field_mse, per_field_rmse, correlation = compute_scored_field_metrics(
+        scored_prediction, scored_target, latitude_weights, eps=eps
+    )
+
+    per_field_primary = per_field_rmse if use_rmse else per_field_mse
+    if teacher_rmse is not None:
+        channel_weights = build_w_score_channel_weights(
+            per_field_rmse, teacher_rmse, temperature=channel_weight_temp, eps=eps
+        )
+        scored_primary = (per_field_primary * channel_weights).mean()
+    else:
+        scored_primary = per_field_primary.mean()
+
     acc_loss = (1.0 - correlation).mean()
 
     auxiliary_mask = torch.ones(prediction.shape[1], device=prediction.device, dtype=torch.bool)
     auxiliary_mask[target_indices] = False
     if auxiliary_weight > 0.0 and auxiliary_mask.any():
+        spatial_weight_sum = latitude_weights.sum() * prediction.shape[-1]
         auxiliary_error = (prediction[:, auxiliary_mask].float() - target[:, auxiliary_mask].float()).square()
         per_aux_field_mse = (auxiliary_error * latitude_weights).sum(dim=(-2, -1)) / spatial_weight_sum
         auxiliary_loss = per_aux_field_mse.mean()
     else:
         auxiliary_loss = prediction.new_zeros((), dtype=torch.float32)
 
-    total = mse_weight * scored_mse + acc_weight * acc_loss + auxiliary_weight * auxiliary_loss
+    total = mse_weight * scored_primary + acc_weight * acc_loss + auxiliary_weight * auxiliary_loss
     components = {
-        "mse": scored_mse.detach(),
+        "mse": scored_primary.detach(),
         "acc": correlation.mean().detach(),
         "aux": auxiliary_loss.detach(),
         "field_mse": per_field_mse.mean(dim=0).detach(),
@@ -144,6 +211,52 @@ def score_aligned_kd_loss(
         (student_scored - teacher_scored).square() * latitude_weights
     ).sum(dim=(-2, -1)) / spatial_weight_sum
     return per_field_mse.mean()
+
+
+def w_score_proxy_loss(
+    prediction,
+    target,
+    target_indices,
+    latitude_weights,
+    teacher_rmse,
+    teacher_acc,
+    w_l=2.0,
+    w_m=2.0,
+    softplus_temp=0.1,
+    eps=1e-6,
+):
+    """方案C: 直接对齐竞赛 W-score (l=m=2) 的可微代理损失。
+
+    W_t = max{(teacher_RMSE_t / student_RMSE_t)^l, 1} + max{(student_ACC_t / teacher_ACC_t)^m, 1}
+    最大化 W 等价于最小化 -W。用 softplus(beta) 平滑近似 max{x, 1}:
+      x >> 1 (领先): term ≈ x, 获得完整二次梯度;
+      x << 1 (落后): term ≈ 1, 保留微弱梯度而不完全停滞。
+
+    teacher_rmse / teacher_acc: [K] 预计算的原模型逐通道参考指标(与本损失同定义)。
+    返回标量 -W_proxy (越小越好), 供 total_loss 以正权重相加。
+    """
+    scored_prediction = prediction.index_select(1, target_indices).float()
+    scored_target = target.index_select(1, target_indices).float()
+
+    _, per_field_rmse, correlation = compute_scored_field_metrics(
+        scored_prediction, scored_target, latitude_weights, eps=eps
+    )
+
+    teacher_rmse_t = teacher_rmse.view(1, -1)
+    teacher_acc_t = teacher_acc.view(1, -1)
+
+    rmse_ratio = (teacher_rmse_t / (per_field_rmse + eps)).clamp(min=eps)
+    acc_ratio = (correlation / (teacher_acc_t + eps)).clamp(min=eps)
+    rmse_pow = rmse_ratio.pow(w_l)
+    acc_pow = acc_ratio.pow(w_m)
+
+    beta = 1.0 / max(softplus_temp, 1e-3)
+    rmse_term = F.softplus(rmse_pow - 1.0, beta=beta) + 1.0
+    acc_term = F.softplus(acc_pow - 1.0, beta=beta) + 1.0
+
+    w_proxy = (rmse_term + acc_term).mean()
+    return -w_proxy
+
 
 def should_skip_train_batch(batch_idx, epoch, skip_stride):
     return skip_stride > 0 and batch_idx % skip_stride == (epoch % skip_stride)
@@ -388,6 +501,53 @@ def main():
             f"MSE={score_mse_weight}, "
             f"spatial ACC proxy={score_acc_weight}, auxiliary MSE={auxiliary_loss_weight}"
         )
+
+    # ---- W-score alignment (方案A/B/C) runtime config ----
+    use_rmse_loss = USE_RMSE_LOSS
+    w_score_channel_weight = W_SCORE_CHANNEL_WEIGHT
+    w_proxy_weight = W_PROXY_WEIGHT
+    w_score_l = float(os.environ.get("W_SCORE_L", "2.0"))
+    w_score_m = float(os.environ.get("W_SCORE_M", "2.0"))
+    channel_weight_temp = float(os.environ.get("W_CHANNEL_WEIGHT_TEMP", "2.0"))
+    softplus_temp = float(os.environ.get("W_SOFTPLUS_TEMP", "0.1"))
+    teacher_rmse_tensor = None
+    teacher_acc_tensor = None
+    need_teacher_metrics = w_score_channel_weight or w_proxy_weight > 0.0
+    if need_teacher_metrics:
+        teacher_metrics_path = os.environ.get("TEACHER_METRICS", "./teacher_metrics.json")
+        if not os.path.exists(teacher_metrics_path):
+            raise FileNotFoundError(
+                f"W-score alignment (方案B/C) requires precomputed teacher metrics: "
+                f"{teacher_metrics_path}. Run precompute_teacher_metrics.py first."
+            )
+        with open(teacher_metrics_path, "r") as tm_file:
+            teacher_metrics = json.load(tm_file)
+        expected_channels = [cfg_data.dataset.channels[i] for i in target_channel_indices]
+        saved_channels = teacher_metrics.get("channels")
+        if saved_channels is not None and list(saved_channels) != list(expected_channels):
+            raise ValueError(
+                "teacher_metrics.json channel order does not match current target channels; "
+                "re-run precompute_teacher_metrics.py"
+            )
+        teacher_rmse_tensor = torch.tensor(
+            teacher_metrics["rmse"], device=local_rank, dtype=torch.float32
+        )
+        teacher_acc_tensor = torch.tensor(
+            teacher_metrics["acc"], device=local_rank, dtype=torch.float32
+        )
+        if world_rank == 0:
+            print(
+                "W-score alignment enabled: "
+                f"use_rmse={use_rmse_loss}, channel_weight={w_score_channel_weight}, "
+                f"proxy_weight={w_proxy_weight}, l={w_score_l}, m={w_score_m}, "
+                f"channel_temp={channel_weight_temp}, softplus_temp={softplus_temp}, "
+                f"teacher metrics from {teacher_metrics_path}"
+            )
+    elif world_rank == 0 and use_rmse_loss:
+        print(f"W-score alignment: 方案A only (use_rmse={use_rmse_loss})")
+
+    # teacher_rmse passed into GT loss only when 方案B is active
+    gt_teacher_rmse = teacher_rmse_tensor if w_score_channel_weight else None
 
     land_mask = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "land_mask.npy")).astype(np.float32))
     soil_type = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "soil_type.npy")).astype(np.float32))
@@ -772,6 +932,7 @@ def main():
         train_loss = 0
         train_gt_loss = 0
         train_kd_loss = 0
+        train_w_loss = 0
         processed_batches = 0
 
         setup_staged_freezing(
@@ -868,7 +1029,24 @@ def main():
                     mse_weight=score_mse_weight,
                     acc_weight=score_acc_weight,
                     auxiliary_weight=auxiliary_loss_weight,
+                    use_rmse=use_rmse_loss,
+                    teacher_rmse=gt_teacher_rmse,
+                    channel_weight_temp=channel_weight_temp,
                 )
+                if w_proxy_weight > 0.0:
+                    w_loss = w_score_proxy_loss(
+                        prediction,
+                        target,
+                        target_indices,
+                        latitude_weights,
+                        teacher_rmse_tensor,
+                        teacher_acc_tensor,
+                        w_l=w_score_l,
+                        w_m=w_score_m,
+                        softplus_temp=softplus_temp,
+                    )
+                else:
+                    w_loss = raw_loss.new_zeros(())
             # 总 loss（按累积步数缩放，使梯度等价于大 batch）
             if kd_active and teacher_model is not None:
                 with torch.no_grad():
@@ -887,12 +1065,13 @@ def main():
             else:
                 kd_loss = raw_loss.new_zeros(())
 
-            total_loss = raw_loss + kd_alpha * kd_loss
+            total_loss = raw_loss + kd_alpha * kd_loss + w_proxy_weight * w_loss
             loss = total_loss / accumulation_steps
             loss.backward()
             train_loss += total_loss.item()
             train_gt_loss += raw_loss.item()
             train_kd_loss += kd_loss.item()
+            train_w_loss += w_loss.item()
             processed_batches += 1
             if processed_batches % accumulation_steps == 0:
                 optimizer.step()
@@ -909,6 +1088,10 @@ def main():
                             + (
                                 f' kd:{train_kd_loss / processed_batches:.04f}(alpha={kd_alpha:.03f})'
                                 if kd_active else ''
+                            )
+                            + (
+                                f' w:{train_w_loss / processed_batches:.04f}(weight={w_proxy_weight:.03f})'
+                                if w_proxy_weight > 0.0 else ''
                             ))
                 if save_interval_sec > 0 and time.time() - last_interval_save >= save_interval_sec:
                     save_checkpoint(
@@ -976,6 +1159,9 @@ def main():
                     mse_weight=score_mse_weight,
                     acc_weight=score_acc_weight,
                     auxiliary_weight=auxiliary_loss_weight,
+                    use_rmse=use_rmse_loss,
+                    teacher_rmse=gt_teacher_rmse,
+                    channel_weight_temp=channel_weight_temp,
                 )
                 # 总 loss
                 loss = loss_tensor.item()
