@@ -17,9 +17,7 @@ from torch.utils.data import Subset
 from torch.cuda.amp import autocast
 from distill_utils import (
     get_kd_alpha,
-    init_bias_table_from_source,
     init_patch_embed_from_official,
-    init_patch_embed_from_source,
     load_teacher_model,
     reset_interface_from_official,
     setup_staged_freezing,
@@ -52,21 +50,6 @@ TARGET_LOSS_CHANNELS = {
     "u_component_of_wind_500",
     "v_component_of_wind_500",
 }
-
-
-def parse_int_tuple(value, name, expected_length):
-    """Parse comma-separated integer model settings from environment variables."""
-    try:
-        parsed = tuple(int(item.strip()) for item in value.split(","))
-    except ValueError as exc:
-        raise ValueError(f"{name} must be comma-separated integers, got {value!r}") from exc
-    if len(parsed) != expected_length:
-        raise ValueError(
-            f"{name} must contain {expected_length} integers, got {parsed}"
-        )
-    return parsed
-
-
 LATITUDE_WEIGHTED_LOSS = os.environ.get("LATITUDE_WEIGHTED_LOSS", "1") != "0"
 LOSS_VERSION = (
     "score_aligned_mse_acc_v1_latitude"
@@ -229,63 +212,6 @@ def build_balanced_monthly_indices(dataset, years, days_per_month=10, seed=42):
     return indices
 
 
-def build_every_n_days_indices(dataset, years, day_stride=3, seed=42):
-    """Select one complete day every ``day_stride`` days, then shuffle globally.
-
-    ERA5 has four six-hourly samples per day.  For every selected calendar day,
-    all four time slots are retained.  Year boundaries are taken from the
-    concatenated per-year datasets so leap years remain aligned correctly.
-    """
-    years = [int(year) for year in years]
-    if not years:
-        raise ValueError("Every-N-days sampling requires at least one training year")
-    if day_stride <= 0:
-        return list(range(len(dataset)))
-
-    if hasattr(dataset, "datasets") and len(dataset.datasets) == len(years):
-        year_lengths = [len(year_dataset) for year_dataset in dataset.datasets]
-    else:
-        # ERA5 forecasting datasets commonly expose 1459 usable samples per
-        # selected year (the final input has no next-step target), including
-        # leap years.  This mirrors train288.py: when the concatenated dataset
-        # is evenly divisible, use the actual datapipe length rather than the
-        # raw calendar length.
-        if len(dataset) % len(years) == 0:
-            samples_per_year = len(dataset) // len(years)
-            year_lengths = [samples_per_year] * len(years)
-        else:
-            raise ValueError(
-                "Cannot infer per-year boundaries for every-N-days sampling: "
-                f"dataset={len(dataset)}, years={len(years)}, "
-                "and no per-year child datasets are available"
-            )
-
-    indices = []
-    selected_days_by_year = {}
-    offset = 0
-    for year, year_length in zip(years, year_lengths):
-        calendar_days = 366 if calendar.isleap(year) else 365
-        complete_days = min(calendar_days, year_length // 4)
-        selected_day_offsets = list(range(0, complete_days, day_stride))
-        selected_days_by_year[year] = len(selected_day_offsets)
-
-        for day_offset in selected_day_offsets:
-            day_start = day_offset * 4
-            for time_slot in range(4):
-                local_index = day_start + time_slot
-                if local_index >= year_length:
-                    raise IndexError(
-                        "Every-N-days sample exceeds year dataset: "
-                        f"year={year}, local_index={local_index}, length={year_length}"
-                    )
-                indices.append(offset + local_index)
-        offset += year_length
-
-    rng = np.random.default_rng(seed)
-    rng.shuffle(indices)
-    return indices, selected_days_by_year
-
-
 def rebuild_dataloader_with_subset(dataloader, indices):
     subset = Subset(dataloader.dataset, indices)
     return torch.utils.data.DataLoader(
@@ -302,11 +228,25 @@ def rebuild_dataloader_with_subset(dataloader, indices):
     )
 
 
-def build_scheduler(optimizer, epoch=0, t_max=100):
+def build_random_training_indices(dataset, max_samples=0, seed=42):
+    """Return a reproducible random permutation/subset of the full dataset."""
+    total_samples = len(dataset)
+    if total_samples <= 0:
+        raise ValueError("Training dataset is empty")
+    if max_samples < 0:
+        raise ValueError("RANDOM_TRAIN_SAMPLES must be zero or positive")
+    rng = np.random.default_rng(seed)
+    indices = rng.permutation(total_samples)
+    if max_samples > 0:
+        indices = indices[: min(max_samples, total_samples)]
+    return indices.tolist()
+
+
+def build_scheduler(optimizer, epoch=0):
     for group in optimizer.param_groups:
         group.setdefault("initial_lr", group["lr"])
     return torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=t_max, last_epoch=epoch - 1
+        optimizer, T_max=100, last_epoch=epoch - 1
     )
 
 
@@ -367,39 +307,7 @@ def main():
             str(getattr(cfg_data.dataset, "balanced_days_per_month", 0)),
         )
     )
-    sample_every_n_days = int(
-        os.environ.get(
-            "SAMPLE_EVERY_N_DAYS",
-            str(getattr(cfg_data.dataset, "sample_every_n_days", 0)),
-        )
-    )
-    if sample_every_n_days > 0 and balanced_days_per_month > 0:
-        raise ValueError(
-            "SAMPLE_EVERY_N_DAYS and BALANCED_DAYS_PER_MONTH cannot both be enabled"
-        )
-
-    if sample_every_n_days > 0:
-        if train_sampler is not None:
-            raise RuntimeError("Every-N-days sampling currently requires single-device training")
-        sampled_indices, selected_days_by_year = build_every_n_days_indices(
-            train_dataloader.dataset,
-            cfg_data.dataset.train_ratio,
-            day_stride=sample_every_n_days,
-            seed=int(getattr(cfg_data.dataset, "random_seed", 42)),
-        )
-        train_dataloader = rebuild_dataloader_with_subset(
-            train_dataloader, sampled_indices
-        )
-        if world_rank == 0:
-            print(
-                "every-N-days training subset: "
-                f"years={list(cfg_data.dataset.train_ratio)}, "
-                f"stride={sample_every_n_days} day(s), four times/day, "
-                f"selected_days={selected_days_by_year}, "
-                f"samples={len(sampled_indices)}, shuffled with "
-                f"seed={int(getattr(cfg_data.dataset, 'random_seed', 42))}"
-            )
-    elif balanced_days_per_month > 0:
+    if balanced_days_per_month > 0:
         if train_sampler is not None:
             raise RuntimeError("Balanced monthly sampling currently requires single-device training")
         balanced_indices = build_balanced_monthly_indices(
@@ -419,6 +327,47 @@ def main():
                 f"four times/day, samples={len(balanced_indices)}"
             )
 
+    shuffle_train_data = os.environ.get("SHUFFLE_TRAIN_DATA", "0") != "0"
+    random_train_samples = int(os.environ.get("RANDOM_TRAIN_SAMPLES", "0"))
+    training_random_seed = int(
+        os.environ.get(
+            "TRAIN_RANDOM_SEED",
+            str(getattr(cfg_data.dataset, "random_seed", 42)),
+        )
+    )
+    if balanced_days_per_month <= 0 and (
+        shuffle_train_data or random_train_samples > 0
+    ):
+        source_samples = len(train_dataloader.dataset)
+        random_indices = build_random_training_indices(
+            train_dataloader.dataset,
+            max_samples=random_train_samples,
+            seed=training_random_seed,
+        )
+        train_dataloader = rebuild_dataloader_with_subset(
+            train_dataloader, random_indices
+        )
+        if world_rank == 0:
+            print(
+                "randomized training order: "
+                f"source_samples={source_samples}, "
+                f"selected_samples={len(random_indices)}, "
+                f"seed={training_random_seed}"
+            )
+    elif balanced_days_per_month > 0 and random_train_samples > 0:
+        if world_rank == 0:
+            print(
+                "RANDOM_TRAIN_SAMPLES ignored because "
+                "BALANCED_DAYS_PER_MONTH already defines the training subset"
+            )
+
+    if "SAMPLE_EVERY_N_DAYS" in os.environ and world_rank == 0:
+        print(
+            "warning: SAMPLE_EVERY_N_DAYS is not used by train.py; "
+            "use SHUFFLE_TRAIN_DATA/RANDOM_TRAIN_SAMPLES or "
+            "BALANCED_DAYS_PER_MONTH"
+        )
+
     target_channel_indices = build_target_channel_indices(cfg_data.dataset.channels)
     target_indices = torch.as_tensor(target_channel_indices, device=local_rank, dtype=torch.long)
     latitude_weights = build_latitude_weights(
@@ -428,7 +377,9 @@ def main():
     )
     score_mse_weight = float(os.environ.get("SCORE_MSE_WEIGHT", "0.8"))
     score_acc_weight = float(os.environ.get("SCORE_ACC_WEIGHT", "0.2"))
-    auxiliary_loss_weight = float(os.environ.get("AUXILIARY_LOSS_WEIGHT", "0.05"))
+    # Keep a small regularizer on unscored fields while concentrating almost
+    # all optimization pressure on the 15 fields used by the competition.
+    auxiliary_loss_weight = float(os.environ.get("AUXILIARY_LOSS_WEIGHT", "0.01"))
     if world_rank == 0:
         print(
             "score-aligned loss: "
@@ -457,35 +408,20 @@ def main():
     ## Train process init
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     run_tag = os.environ.get("RUN_TAG", "").strip()
-    adapt_from = os.environ.get("ADAPT_FROM", "").strip()
-    prune_from_env = os.environ.get("PRUNE_FROM", "").strip()
     warm_start_from = os.environ.get("WARM_START_FROM", "").strip()
-    if adapt_from and prune_from_env:
-        raise ValueError("Set only one of ADAPT_FROM or PRUNE_FROM")
-    if warm_start_from and (adapt_from or prune_from_env):
-        raise ValueError("WARM_START_FROM cannot be combined with ADAPT_FROM/PRUNE_FROM")
-    transfer_from = adapt_from or prune_from_env
-    transfer_label = "ADAPT_FROM" if adapt_from else "PRUNE_FROM"
-    # ADAPT_FROM and WARM_START_FROM keep the legacy 2_10_10 filenames unless
-    # RUN_TAG is explicitly provided.  Structural pruning keeps its historical tag.
-    if not run_tag and prune_from_env:
-        run_tag = "pruned2642"
-        if world_rank == 0:
-            print(
-                f"PRUNE_FROM is set; generated RUN_TAG={run_tag} "
-                "to protect the source checkpoint"
-            )
-    elif not run_tag and (adapt_from or warm_start_from):
-        if world_rank == 0:
-            print(
-                "legacy output filenames enabled: model_2_10_10_{bak,latest}.pth "
-                "and {trloss,valoss}_2_10_10.npy"
-            )
+    checkpoint_prefix = os.environ.get("CHECKPOINT_PREFIX", "model_288").strip()
     if run_tag and not all(char.isalnum() or char in "-_" for char in run_tag):
-        raise ValueError("RUN_TAG may contain only letters, digits, '-' and '_")
+        raise ValueError("RUN_TAG may contain only letters, digits, '-' and '_'")
+    if not checkpoint_prefix or not all(
+        char.isalnum() or char in "-_" for char in checkpoint_prefix
+    ):
+        raise ValueError(
+            "CHECKPOINT_PREFIX may contain only letters, digits, '-' and '_'"
+        )
     artifact_suffix = f"_{run_tag}" if run_tag else ""
-    train_loss_file = f"{cfg.checkpoint_dir}/trloss_2_10_10{artifact_suffix}.npy"
-    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_2_10_10{artifact_suffix}.npy"
+    checkpoint_stem = f"{checkpoint_prefix}{artifact_suffix}"
+    train_loss_file = f"{cfg.checkpoint_dir}/trloss_{checkpoint_stem}.npy"
+    valid_loss_file = f"{cfg.checkpoint_dir}/valoss_{checkpoint_stem}.npy"
     best_valid_loss = 1.0e6
     best_loss_epoch = 0
     train_losses = np.empty((0,), dtype=np.float32)
@@ -500,8 +436,8 @@ def main():
         print("-" * 50, "\n")
 
     ## Checkpoint file names
-    best_ckpt_name = f"model_2_10_10{artifact_suffix}_bak.pth"
-    latest_ckpt_name = f"model_2_10_10{artifact_suffix}_latest.pth"
+    best_ckpt_name = f"{checkpoint_stem}_bak.pth"
+    latest_ckpt_name = f"{checkpoint_stem}_latest.pth"
     best_ckpt_path = os.path.join(cfg.checkpoint_dir, best_ckpt_name)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, latest_ckpt_name)
     save_interval_sec = int(os.environ.get("SAVE_INTERVAL_SEC", "600"))
@@ -513,14 +449,24 @@ def main():
     resume_ckpt_data = None
     loss_definition_changed = False
     reset_optimizer = os.environ.get("RESET_OPTIMIZER", "0") != "0"
-    override_resume_lr = os.environ.get("OVERRIDE_RESUME_LR", "0") != "0"
-    # Conservative defaults for adapting an already-trained model to a new patch size.
-    backbone_lr = float(os.environ.get("BACKBONE_LR", "2e-6"))
-    interface_lr = float(os.environ.get("INTERFACE_LR", "1e-5"))
+    reset_batch_offset = os.environ.get("RESET_BATCH_OFFSET", "0") != "0"
+    explicit_backbone_lr = "BACKBONE_LR" in os.environ
+    explicit_interface_lr = "INTERFACE_LR" in os.environ
+    if explicit_backbone_lr != explicit_interface_lr:
+        raise ValueError(
+            "Set BACKBONE_LR and INTERFACE_LR together when resuming training"
+        )
+    explicit_lr_requested = explicit_backbone_lr and explicit_interface_lr
+    override_resume_lr = (
+        os.environ.get("OVERRIDE_RESUME_LR", "0") != "0"
+        or explicit_lr_requested
+    )
+    backbone_lr = float(os.environ.get("BACKBONE_LR", "5e-5"))
+    interface_lr = float(os.environ.get("INTERFACE_LR", "2e-4"))
     kd_enabled = os.environ.get("KD_ENABLED", "0") != "0"
     kd_interface_only = os.environ.get("KD_INTERFACE_ONLY", "1") != "0"
-    kd_alpha_start = float(os.environ.get("KD_ALPHA", "0.05"))
-    kd_alpha_end = float(os.environ.get("KD_ALPHA_MIN", "0.01"))
+    kd_alpha_start = float(os.environ.get("KD_ALPHA", "0.2"))
+    kd_alpha_end = float(os.environ.get("KD_ALPHA_MIN", "0.02"))
     patch_embed_init = os.environ.get("PATCH_EMBED_INIT", "1") != "0"
     reset_interface = os.environ.get("RESET_INTERFACE", "0") != "0"
     freeze_backbone_epochs = int(os.environ.get("FREEZE_BACKBONE_EPOCHS", "0"))
@@ -528,27 +474,18 @@ def main():
 
     if reset_interface:
         reset_optimizer = True
+    if kd_enabled and kd_interface_only and freeze_backbone_epochs <= 0:
+        raise ValueError(
+            "KD_INTERFACE_ONLY=1 requires FREEZE_BACKBONE_EPOCHS > 0"
+        )
 
-    prune_from = transfer_from
-    # Auto-resume an existing transfer run unless explicitly restarted.
-    force_retransfer = (
-        os.environ.get("FORCE_RETRANSFER", "0") != "0"
-        or os.environ.get("FORCE_REPRUNE", "0") != "0"
-    )
-    if prune_from and not force_retransfer and (os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path)):
-        if world_rank == 0:
-            print("\n" + "-" * 50)
-            print(f"existing transfer checkpoint found: {latest_ckpt_path}")
-            print("switching to resume mode; use FORCE_RETRANSFER=1 to restart")
-            print("-" * 50 + "\n")
-        prune_from = ""
     # ---- New data curriculum: inherit model weights only and start fresh progress. ----
     if warm_start_from:
         if not os.path.exists(warm_start_from):
             raise FileNotFoundError(f"WARM_START_FROM checkpoint not found: {warm_start_from}")
         if world_rank == 0:
             print("\n" + "-" * 50)
-            print(f"warm start from: {warm_start_from}")
+            print(f"12-year warm start from: {warm_start_from}")
             print("loading model weights only; optimizer/scheduler/progress reset")
             print("-" * 50 + "\n")
         ckpt = torch.load(warm_start_from, map_location="cpu", weights_only=False)
@@ -564,101 +501,7 @@ def main():
         if world_rank == 0:
             logger.info(f"loaded model weights from {warm_start_from}")
 
-    # ---- Step 0 (剪枝 warm start): 从全量 checkpoint 做结构剪枝的权重迁移 ----
-    elif prune_from:
-        if not os.path.exists(prune_from):
-            raise FileNotFoundError(f"{transfer_label} checkpoint not found: {prune_from}")
-        if world_rank == 0:
-            print("\n")
-            print("-" * 50)
-            print(
-                f"model transfer: loading {prune_from} into "
-                f"patch_size={list(cfg.patch_size)}, depth={list(cfg.depth)}"
-            )
-            print("-" * 50 + "\n")
-        ckpt = torch.load(prune_from, map_location="cpu", weights_only=False)
-        src_state = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-
-        source_depth = ckpt.get("depth") if isinstance(ckpt, dict) else None
-        if adapt_from and source_depth is not None:
-            source_depth = tuple(int(value) for value in source_depth)
-            target_depth = tuple(int(value) for value in cfg.depth)
-            if source_depth != target_depth:
-                raise RuntimeError(
-                    "ADAPT_FROM changes patch size only and requires matching depth: "
-                    f"source={source_depth}, target={target_depth}. "
-                    "Use PRUNE_FROM only when structural pruning is intentional."
-                )
-
-        model_state = model.state_dict()
-        filtered_state = {}
-        skipped_keys = []
-        for k, v in src_state.items():
-            if k in model_state:
-                if model_state[k].shape == v.shape:
-                    filtered_state[k] = v
-                else:
-                    skipped_keys.append(k)
-
-        missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
-        real_missing = [k for k in missing_keys if "attn_mask" not in k]
-        attn_mask_missing = [k for k in missing_keys if "attn_mask" in k]
-        structural_missing = [k for k in real_missing if k not in skipped_keys]
-
-        pruned_count = len(src_state) - len(filtered_state) - len(skipped_keys)
-        if adapt_from and pruned_count > 0:
-            raise RuntimeError(
-                "ADAPT_FROM detected parameters absent from the target model "
-                f"({pruned_count} keys). Keep source/target depth identical, or use "
-                "PRUNE_FROM when pruning is intentional."
-            )
-        if adapt_from and structural_missing:
-            raise RuntimeError(
-                "ADAPT_FROM found target parameters absent from the source checkpoint: "
-                f"{structural_missing[:20]}. This usually means source/target depth "
-                "does not match. ADAPT_FROM must not randomly initialize Transformer blocks."
-            )
-        if world_rank == 0:
-            print(f"✅ 已迁移 {len(filtered_state)} 个参数")
-            print(f"✂️  跳过 {pruned_count} 个被剪枝的参数（layer3.block4/block5 不存在于新模型）")
-            if skipped_keys:
-                print(f"⚠️  {len(skipped_keys)} 个参数因形状不匹配跳过: {skipped_keys[:10]}")
-            print(f"   {len(real_missing)} 个参数随机初始化")
-            print(f"   attn_mask buffer {len(attn_mask_missing)} 个将自动重建")
-            print(f"   optimizer/scheduler 从头初始化，从 epoch 0 开始训练")
-
-        start_epoch = 0
-        start_batch = 0
-
-        # patch_size 变更时，用插值初始化不匹配的 patch_embed/recovery conv 权重
-        if patch_embed_init and skipped_keys:
-            if world_rank == 0:
-                print("initializing mismatched patch projections from PRUNE_FROM source")
-            init_patch_embed_from_source(
-                model,
-                prune_from,
-                device="cpu",
-                log_fn=print if world_rank == 0 else lambda *args: None,
-            )
-
-        # earth_position_bias_table 窗口维度插值初始化
-        if patch_embed_init:
-            if world_rank == 0:
-                print("initializing earth_position_bias_table from PRUNE_FROM source")
-            init_bias_table_from_source(
-                model,
-                prune_from,
-                device="cpu",
-                log_fn=print if world_rank == 0 else lambda *args: None,
-            )
-
-        # Patch adaptation / pruning should start from conservative learning rates.
-        if "BACKBONE_LR" not in os.environ:
-            backbone_lr = 2e-6
-        if "INTERFACE_LR" not in os.environ:
-            interface_lr = 1e-5
-
-    # ---- Step 1: 断点续训（优先）：2_10_10 checkpoint = 继承全量模型训练后的结果 ----
+    # ---- Step 1: 断点续训（优先）：288 checkpoint = 继承全量模型训练后的结果 ----
     elif os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path):
         resume_ckpt = latest_ckpt_path if os.path.exists(latest_ckpt_path) else best_ckpt_path
         if world_rank == 0:
@@ -735,7 +578,7 @@ def main():
             if reset_optimizer:
                 print("new loss/lr mode: loaded model weights and progress; optimizer/scheduler/best loss reset")
 
-    # ---- Step 1 (备): warm start：无 2_10_10 checkpoint 时，从 244 全量权重部分迁移 ----
+    # ---- Step 1 (备): warm start：无 288 checkpoint 时，从 244 全量权重部分迁移 ----
     elif os.path.exists(os.path.join(cfg.checkpoint_dir, "model_bak.pth")):
         warm_start_path = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
         if world_rank == 0:
@@ -777,8 +620,11 @@ def main():
 
         if patch_embed_init:
             if world_rank == 0:
-                print("initializing mismatched patch projections: source -> target patch_size")
-            initialized_count = init_patch_embed_from_source(
+                print(
+                    "initializing mismatched patch projections: "
+                    f"[2,4,4] -> {list(cfg.patch_size)}"
+                )
+            initialized_count = init_patch_embed_from_official(
                 model,
                 warm_start_path,
                 device="cpu",
@@ -788,18 +634,16 @@ def main():
                 print(f"initialized {initialized_count} patch projection weights")
             if initialized_count == 0:
                 raise RuntimeError(
-                    "PATCH_EMBED_INIT=1 did not find compatible projection weights to initialize"
+                    "PATCH_EMBED_INIT=1 did not find compatible 4x4 -> 8x8 projection weights"
                 )
 
-            # earth_position_bias_table 窗口维度插值初始化
-            if world_rank == 0:
-                print("initializing earth_position_bias_table from source")
-            init_bias_table_from_source(
-                model,
-                warm_start_path,
-                device="cpu",
-                log_fn=print if world_rank == 0 else lambda *args: None,
+    if reset_batch_offset and start_batch != 0:
+        if world_rank == 0:
+            print(
+                "resetting checkpoint batch offset for a new shuffled pass: "
+                f"{start_batch} -> 0 (model and optimizer are preserved)"
             )
+        start_batch = 0
 
     if world_rank == 0:
         total = sum(p.numel() for p in model.parameters())
@@ -812,51 +656,22 @@ def main():
 
     ## Optimizer init: low-lr full fine-tuning with separate backbone/interface groups.
     optimizer = build_optimizer(model, backbone_lr=backbone_lr, interface_lr=interface_lr)
-    scheduler = build_scheduler(optimizer, t_max=cfg.max_epoch)
+    scheduler = build_scheduler(optimizer)
 
-    # Freeze is an experiment-level phase, not a per-process phase.  Restarts must
-    # not append another FREEZE_BACKBONE_EPOCHS epochs to the warm-up.
-    if resume_ckpt_data is not None:
-        freeze_until_epoch = int(
-            resume_ckpt_data.get(
-                "freeze_until_epoch", max(0, freeze_backbone_epochs)
-            )
-        )
-    else:
-        freeze_until_epoch = max(0, freeze_backbone_epochs)
-
-    teacher_ckpt = os.environ.get(
-        "TEACHER_CKPT", os.path.join(cfg.checkpoint_dir, "model_bak.pth")
-    ).strip()
-    teacher_patch_size = parse_int_tuple(
-        os.environ.get("TEACHER_PATCH_SIZE", "2,4,4"),
-        "TEACHER_PATCH_SIZE",
-        3,
-    )
-    teacher_depth = parse_int_tuple(
-        os.environ.get("TEACHER_DEPTH", "2,6,6,2"),
-        "TEACHER_DEPTH",
-        4,
-    )
-    kd_will_be_active = kd_enabled and (
-        not kd_interface_only or start_epoch < freeze_until_epoch
-    )
-    if kd_enabled and kd_interface_only and freeze_until_epoch <= 0:
-        raise ValueError(
-            "KD_INTERFACE_ONLY=1 requires FREEZE_BACKBONE_EPOCHS > 0 "
-            "for a new experiment"
-        )
-    if kd_will_be_active:
+    freeze_until_epoch = start_epoch + max(0, freeze_backbone_epochs)
+    if kd_enabled:
+        teacher_ckpt = os.path.join(cfg.checkpoint_dir, "model_bak.pth")
         if not os.path.exists(teacher_ckpt):
-            raise FileNotFoundError(
-                f"KD_ENABLED=1 requires teacher checkpoint: {teacher_ckpt}"
-            )
+            raise FileNotFoundError(f"KD_ENABLED=1 requires official checkpoint: {teacher_ckpt}")
+        teacher_depth = tuple(
+            int(value) for value in os.environ.get("TEACHER_DEPTH", "2,6,6,2").split(",")
+        )
         teacher_model = load_teacher_model(
             teacher_ckpt,
             img_size=cfg_data.dataset.img_size,
             device=local_rank,
             depth=teacher_depth,
-            patch_size=teacher_patch_size,
+            patch_size=(2, 4, 4),
             embed_dim=cfg.embed_dim,
             num_heads=cfg.num_heads,
             window_size=cfg.window_size,
@@ -866,34 +681,15 @@ def main():
         if world_rank == 0:
             print(
                 f"distillation enabled: alpha {kd_alpha_start} -> {kd_alpha_end}, "
-                f"teacher={teacher_ckpt}, patch_size={list(teacher_patch_size)}, "
-                f"depth={list(teacher_depth)}, scored fields only, "
+                "teacher patch_size=[2,4,4], scored fields only, "
                 f"interface_only={kd_interface_only}"
             )
 
-    if world_rank == 0 and freeze_until_epoch > start_epoch:
+    if world_rank == 0 and freeze_backbone_epochs > 0:
         print(
-            f"backbone warm-up freeze: epochs [0, {freeze_until_epoch}); "
-            f"current start_epoch={start_epoch}"
+            f"backbone warm-up freeze: epochs [{start_epoch}, {freeze_until_epoch}) "
+            f"({freeze_backbone_epochs} epoch(s))"
         )
-
-    checkpoint_metadata = {
-        "patch_size": list(cfg.patch_size),
-        "depth": list(cfg.depth),
-        "train_years": [int(year) for year in cfg_data.dataset.train_ratio],
-        "validation_years": [int(year) for year in cfg_data.dataset.val_ratio],
-        "sample_every_n_days": sample_every_n_days,
-        "sampling_seed": int(getattr(cfg_data.dataset, "random_seed", 42)),
-        "freeze_until_epoch": freeze_until_epoch,
-        "source_checkpoint": warm_start_from or transfer_from or None,
-        "transfer_mode": (
-            "adapt" if adapt_from else "prune" if prune_from_env else "warm_start"
-            if warm_start_from else None
-        ),
-        "teacher_checkpoint": teacher_ckpt if kd_will_be_active else None,
-        "teacher_patch_size": list(teacher_patch_size) if kd_will_be_active else None,
-        "teacher_depth": list(teacher_depth) if kd_will_be_active else None,
-    }
 
     ## Only restore optimizer/scheduler when explicitly requested.
     if resume_ckpt_data is not None and not reset_optimizer:
@@ -916,6 +712,11 @@ def main():
                 print(
                     "resumed learning rates overridden: "
                     f"backbone={backbone_lr}, interface={interface_lr}"
+                    + (
+                        " (explicit BACKBONE_LR/INTERFACE_LR)"
+                        if explicit_lr_requested
+                        else ""
+                    )
                 )
             else:
                 print(
@@ -950,9 +751,19 @@ def main():
     if cfg.world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
-    world_rank == 0 and logger.info(f"start training from epoch {start_epoch} ...")
+    max_run_epochs = int(os.environ.get("MAX_RUN_EPOCHS", "0"))
+    if max_run_epochs < 0:
+        raise ValueError("MAX_RUN_EPOCHS must be zero or positive")
+    run_end_epoch = (
+        min(cfg.max_epoch, start_epoch + max_run_epochs)
+        if max_run_epochs > 0
+        else cfg.max_epoch
+    )
+    world_rank == 0 and logger.info(
+        f"start training from epoch {start_epoch}, stop before epoch {run_end_epoch} ..."
+    )
 
-    for epoch in range(start_epoch, cfg.max_epoch):
+    for epoch in range(start_epoch, run_end_epoch):
         if dist.is_initialized():
             train_sampler.set_epoch(epoch)
             val_sampler.set_epoch(epoch)
@@ -993,11 +804,11 @@ def main():
             current_offset = 0
 
         # train_max_batches / train_skip_stride 始终基于全量 DataLoader 计算
-        # 0 means use the complete training set, matching the stable 288 workflow.
+        # 0 means use the complete (possibly balanced) training subset.
         train_max_batches = int(os.environ.get("TRAIN_MAX_BATCHES", "0"))
         if epoch < freeze_until_epoch:
             train_max_batches = int(
-                os.environ.get("WARMUP_MAX_BATCHES", "100")
+                os.environ.get("WARMUP_MAX_BATCHES", str(train_max_batches))
             )
         full_train_total = len(original_train_dataloader)
         if train_max_batches > 0 and train_max_batches < full_train_total:
@@ -1104,7 +915,6 @@ def main():
                         model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
                         cfg.checkpoint_dir, latest_ckpt_name,
                         epoch=epoch, next_batch_idx=current_offset + j + 1, epoch_complete=False,
-                        metadata=checkpoint_metadata,
                     )
                     logger.info(f"interval checkpoint saved at epoch={epoch}, next_batch={current_offset + j + 1}")
                     last_interval_save = time.time()
@@ -1122,8 +932,7 @@ def main():
         valid_aux = 0
         valid_field_mse = np.zeros(len(target_channel_indices), dtype=np.float64)
         valid_field_acc = np.zeros(len(target_channel_indices), dtype=np.float64)
-        # 0 evaluates the complete validation year; set VAL_MAX_SAMPLES to cap it.
-        val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", "0"))
+        val_max_samples = int(os.environ.get("VAL_MAX_SAMPLES", "500"))
         if "VAL_MAX_BATCHES" in os.environ and "VAL_MAX_SAMPLES" not in os.environ:
             val_max_samples = int(os.environ["VAL_MAX_BATCHES"]) * cfg_data.dataloader.batch_size
         val_dataset = val_dataloader.dataset
@@ -1214,7 +1023,6 @@ def main():
                     model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
                     cfg.checkpoint_dir, best_ckpt_name,
                     epoch=epoch, next_batch_idx=0, epoch_complete=True,
-                    metadata=checkpoint_metadata,
                 )
             is_save_ckp = True
 
@@ -1225,7 +1033,6 @@ def main():
                 model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
                 cfg.checkpoint_dir, latest_ckpt_name,
                 epoch=epoch, next_batch_idx=0, epoch_complete=True,
-                metadata=checkpoint_metadata,
             )
 
         if world_rank == 0:
@@ -1246,19 +1053,7 @@ def main():
             exit()
 
 
-def save_checkpoint(
-    model,
-    optimizer,
-    scheduler,
-    best_valid_loss,
-    best_loss_epoch,
-    model_path,
-    filename,
-    epoch=None,
-    next_batch_idx=0,
-    epoch_complete=True,
-    metadata=None,
-):
+def save_checkpoint(model, optimizer, scheduler, best_valid_loss, best_loss_epoch, model_path, filename, epoch=None, next_batch_idx=0, epoch_complete=True):
     model_to_save = model.module if hasattr(model, "module") else model
     state = {
         "model_state_dict": model_to_save.state_dict(),
@@ -1271,8 +1066,6 @@ def save_checkpoint(
         "epoch_complete": epoch_complete,
         "loss_version": LOSS_VERSION,
     }
-    if metadata:
-        state.update(metadata)
     os.makedirs(model_path, exist_ok=True)
     tmp_path = os.path.join(model_path, filename + ".tmp")
     dst_path = os.path.join(model_path, filename)
