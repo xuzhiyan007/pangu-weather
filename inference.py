@@ -201,22 +201,62 @@ def main():
         )
     model.eval()
 
-    output_dir = os.path.join("result", "output")
+    # The official evaluator permits online compilation before sample timing.
+    # The submission contains source only; no precompiled binary is required.
+    use_dcu_window_op = os.environ.get("USE_DCU_WINDOW_OP", "1") != "0"
+    fused_window_blocks = 0
+    if use_dcu_window_op:
+        from dcu_ops import enable_fused_window_partition
+
+        fused_window_blocks = enable_fused_window_partition(model)
+        if fused_window_blocks == 0:
+            raise RuntimeError(
+                "USE_DCU_WINDOW_OP=1 but no EarthTransformer3DBlock was patched"
+            )
+
+    output_dir = os.environ.get("OUTPUT_DIR", os.path.join("result", "output"))
+    time_record_path = os.environ.get(
+        "TIME_RECORD_PATH", os.path.join("result", "time_record.json")
+    )
+    max_inference_samples = int(os.environ.get("MAX_INFERENCE_SAMPLES", "0"))
+    if max_inference_samples < 0:
+        raise ValueError("MAX_INFERENCE_SAMPLES must be zero or greater")
     os.makedirs(output_dir, exist_ok=True)
+    time_record_dir = os.path.dirname(time_record_path)
+    if time_record_dir:
+        os.makedirs(time_record_dir, exist_ok=True)
     print(f"checkpoint: {checkpoint_path}")
     print(f"model depth: {list(checkpoint_depth)}")
     print(f"patch size: {list(checkpoint_patch_size)}")
     print(f"infer dtype: {infer_dtype}")
     print(f"int8 storage scope: {light_format.get('int8_scope', 'unknown')}")
+    print(
+        f"fused pad/shift/window partition: {use_dcu_window_op}, "
+        f"patched blocks: {fused_window_blocks}"
+    )
+    if max_inference_samples:
+        print(f"test mode: stop after {max_inference_samples} sample(s)")
     if missing_keys:
         print(f"recreated {len(missing_keys)} attn_mask buffers from model init")
-    print("samples will be generated to './result/output/'")
+    print(f"samples will be generated to '{output_dir}'")
 
     time_list = []
     generated_count = 0
     first = True
     with torch.no_grad():
-        for data in tqdm(test_dataloader, desc="Inferring testset", unit="batch"):
+        progress_total = (
+            min(len(test_dataloader), max_inference_samples)
+            if max_inference_samples
+            else len(test_dataloader)
+        )
+        for data in tqdm(
+            test_dataloader,
+            desc="Inferring testset",
+            unit="batch",
+            total=progress_total,
+        ):
+            if max_inference_samples and generated_count >= max_inference_samples:
+                break
             invar = data[0]
             filename = data[4][-1][0]
             if first:
@@ -263,12 +303,19 @@ def main():
             generated_count += 1
 
             del out_surface_cpu, out_upper_air_cpu, prediction
+            if max_inference_samples and generated_count >= max_inference_samples:
+                break
 
-    if generated_count != len(test_dataloader):
+    expected_count = (
+        min(len(test_dataloader), max_inference_samples)
+        if max_inference_samples
+        else len(test_dataloader)
+    )
+    if generated_count != expected_count:
         raise RuntimeError(
-            f"Generated {generated_count} files, expected {len(test_dataloader)}"
+            f"Generated {generated_count} files, expected {expected_count}"
         )
-    with open(os.path.join("result", "time_record.json"), "w", encoding="utf-8") as f:
+    with open(time_record_path, "w", encoding="utf-8") as f:
         json.dump(time_list, f, ensure_ascii=False, indent=4)
     print(f"generated {generated_count} prediction file(s)")
 
